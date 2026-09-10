@@ -161,6 +161,18 @@ class StructuredOutput(Evaluator[InputT, OutputT]):
         # though the harness calls evaluate() from up to `max_workers` threads via
         # asyncio.to_thread (default 10). Everything is read afterwards, on one
         # thread, by metrics() and per_case().
+        #
+        # Append-only is a correctness argument, not a measured one: a
+        # read-modify-write mutant of this line did NOT lose results across 1000
+        # cases at 32 workers on CPython 3.12, so a race test cannot stand in for
+        # it. `test_the_accumulator_is_append_only` pins the structure instead.
+        #
+        # `evaluate_async` is deliberately NOT overridden. The base class's is
+        # `await asyncio.to_thread(self.evaluate, ...)`, which is what puts this on
+        # worker threads at all; a synchronous override would run the comparison
+        # inline on the event loop, making the sentence above false and the
+        # concurrency test vacuous, and would block every other case's task on a
+        # CPU-bound Hungarian match.
         self._results: list[_CaseResult] = []
 
     def evaluate(self, evaluation_case: EvaluationData[InputT, OutputT]) -> list[EvaluationOutput]:
@@ -208,20 +220,19 @@ class StructuredOutput(Evaluator[InputT, OutputT]):
                 score=result.overall_score,
                 test_pass=result.matched,
                 reason=self._weakest(result.field_scores),
+                # The model class, so a mixed-schema run can be grouped by output
+                # type. Two caveats worth knowing. `EvaluationOutput.label` is
+                # documented as the categorical label for the score, and the
+                # harness derives its own span label from the score independently,
+                # so the two describe different things. And this is the raw
+                # `__name__`, while `per_case` and `metrics` use the disambiguated
+                # name: with two same-named classes the label cannot be joined
+                # back to its rollup. The disambiguated name is not available here
+                # because it depends on which classes appear across the whole run,
+                # which is not known until the run ends.
                 label=cls.__name__,
             )
         ]
-
-    async def evaluate_async(self, evaluation_case: EvaluationData[InputT, OutputT]) -> list[EvaluationOutput]:
-        """Async counterpart to `evaluate`. The comparison is CPU-bound and offline.
-
-        Args:
-            evaluation_case: The case to score.
-
-        Returns:
-            A single-element list carrying the weighted score for the case.
-        """
-        return self.evaluate(evaluation_case)
 
     def metrics(self) -> dict[str, Any]:
         """Per-field metrics across every case evaluated so far.
@@ -261,6 +272,11 @@ class StructuredOutput(Evaluator[InputT, OutputT]):
         score is emitted for them; use `metrics` for those, which reports their
         counts and precision/recall/F1.
 
+        Do NOT positionally zip this with `report.scores`. That is index-ordered
+        while this is completion-ordered, and the harness records a failed
+        evaluator as a zero-score row without `evaluate` ever appending here, so
+        the two can differ in length as well as order. Join on `case` instead.
+
         Returns:
             One entry per case with `case`, `model`, `overall_score`, `matched` and
             `field_scores`.
@@ -282,8 +298,13 @@ class StructuredOutput(Evaluator[InputT, OutputT]):
 
         Evaluator instances are shared across cases and may be reused across
         experiments, so a stateful evaluator needs an explicit way to clear.
+
+        Clears the inferred-spec cache as well as the results. Keeping the specs
+        meant `explain()` still raised "ambiguous across 2 inferred schemas" after a
+        reset, naming a class that contributed nothing to the current results.
         """
         self._results.clear()
+        self._specs.clear()
 
     def explain(self) -> dict[str, dict[str, Any]]:
         """Per-field comparison config and why it was chosen.

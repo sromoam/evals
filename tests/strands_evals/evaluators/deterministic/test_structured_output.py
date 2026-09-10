@@ -8,6 +8,8 @@ default concurrency.
 """
 
 import asyncio
+import inspect
+import threading
 
 import pytest
 from pydantic import BaseModel, Field, ValidationError
@@ -320,11 +322,51 @@ class TestMixedSchemas:
 
 
 class TestConcurrency:
+    """The accumulator has to survive the harness running evaluate() on threads.
+
+    `Evaluator.evaluate_async` is `await asyncio.to_thread(self.evaluate, ...)`, and
+    `run_evaluations_async` defaults to `max_workers=10`, so anything accumulated
+    across cases is shared mutable state on many threads. `list.append` is atomic
+    under the GIL and needs no lock; a read-modify-write is not guaranteed to be.
+    That is a correctness argument rather than a measured one -- see
+    `test_the_accumulator_is_append_only`.
+    """
+
+    def test_evaluate_really_runs_on_worker_threads(self):
+        """The premise of everything below.
+
+        If `evaluate_async` were overridden with a synchronous body, the base
+        class's `to_thread` offload would be bypassed, every case would run inline
+        on the event loop, and the retention test below would be single-threaded and
+        therefore vacuous. Asserting the thread count is what keeps that from
+        happening silently.
+        """
+        seen: set[str] = set()
+
+        class Probe(StructuredOutput):
+            def evaluate(self, evaluation_case):
+                seen.add(threading.current_thread().name)
+                return super().evaluate(evaluation_case)
+
+        n = 40
+        _run(
+            Probe(Invoice),
+            {f"c{i}": (_invoice(), _invoice()) for i in range(n)},
+            max_workers=10,
+        )
+
+        assert seen, "evaluate() never ran"
+        assert seen != {"MainThread"}, (
+            "evaluate() ran only on the main thread, so the harness's to_thread "
+            "offload was bypassed -- is evaluate_async overridden?"
+        )
+
     def test_no_results_are_lost_at_the_harness_default(self):
-        """`run_evaluations_async` defaults to max_workers=10 and calls
-        evaluate() through asyncio.to_thread, so this runs on many threads. A
-        naive shared counter loses ~18% of documents; appending to a list is
-        atomic under the GIL and loses none.
+        """Every case is retained when the harness runs them concurrently.
+
+        A retention check, not a proof against every possible race: a
+        read-modify-write mutant of the append survives this test on CPython 3.12,
+        so it cannot stand in for the correctness argument in the class docstring.
         """
         n = 200
         evaluator = StructuredOutput(Invoice)
@@ -337,6 +379,18 @@ class TestConcurrency:
         assert len(report.scores) == n
         assert len(evaluator._results) == n
         assert evaluator.metrics()["Invoice"].document_count == n
+
+    def test_the_accumulator_is_append_only(self):
+        """Pins the property the docstring rests on, since a race test cannot.
+
+        `evaluate` must only ever `append`. Rebinding `_results`, or mutating it
+        through a read-modify-write, is the shape that is not guaranteed atomic --
+        and measurement will not catch it reliably, so the structure is asserted
+        instead.
+        """
+        source = inspect.getsource(StructuredOutput.evaluate)
+        assert "self._results.append(" in source
+        assert "self._results =" not in source
 
 
 class TestCoercion:
