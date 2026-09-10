@@ -241,6 +241,7 @@ strands-evals/
 - **`tests/strands_evals/`**: Unit tests mirroring src/ structure
 - **`tests/strands_evals/cli/`**: CLI tests; fixtures live under `cli/fixtures/` and are referenced by tests via `tests.strands_evals.cli.fixtures.*:attr` specs
 - **`tests_integ/`**: Integration tests using real trace providers and model endpoints
+- **`examples/notebooks/`**: Runnable notebooks, committed with their outputs so results are readable without executing. Offline and deterministic where possible; see `examples/notebooks/README.md`
 - **`docs are not vendored yet`**: CONTRIBUTING.md and STYLE_GUIDE.md are the canonical references
 
 **IMPORTANT**: After making changes that affect the directory structure, update this section to reflect the current state of the repository.
