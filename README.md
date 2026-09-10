@@ -154,6 +154,9 @@ pip install -e ".[test]"
 
 # Install with both test and dev dependencies
 pip install -e ".[test,dev]"
+
+# Install with field-level structured-output scoring
+pip install -e ".[stickler]"
 ```
 
 ## Features at a Glance
@@ -500,6 +503,60 @@ class PolicyComplianceEvaluator(Evaluator[str, str]):
         return []
 ```
 
+### Field-Level Structured Output Scoring
+
+`Equals` compares structured output with whole-object `==`, so it scores 0.0 or 1.0.
+`StructuredOutput` compares field by field and tells you which field to fix.
+Deterministic and offline: no LLM judge, no credentials, no per-call cost.
+
+```python
+from pydantic import BaseModel
+from strands_evals.evaluators import StructuredOutput
+
+class LineItem(BaseModel):
+    sku: str | None = None
+    quantity: int | None = None
+
+class Invoice(BaseModel):
+    invoice_id: str
+    vendor_name: str
+    total_amount: float | None = None
+    line_items: list[LineItem] = []
+
+# The same model the agent already emits as structured_output_model.
+evaluator = StructuredOutput(Invoice)
+report = Experiment(cases=cases, evaluators=[evaluator]).run_evaluations(task)
+
+report.overall_score      # weighted mean across the dataset
+evaluator.per_case()      # per-document field scores
+evaluator.metrics()       # per-field confusion matrix, keyed by dotted path
+evaluator.explain()       # the comparator chosen per field, and why
+```
+
+Line items that arrive in a different order are the clearest case. The content is
+identical, so the extraction is correct:
+
+| | `Equals` | `StructuredOutput` |
+|---|---|---|
+| list reordered, content identical | `0.0` | `1.0` |
+| one quantity wrong, list reordered | `0.0` | `0.9375` |
+
+In the second row `reason` reads `weakest fields: line_items=0.75`, and
+`per_case()` gives `{'invoice_id': 1.0, 'vendor_name': 1.0, 'total_amount': 1.0,
+'line_items': 0.75}`. `metrics()` reports counts against the nested paths too --
+`line_items.sku` and `line_items.quantity` -- so a suite tells you which field
+your agent gets wrong across the whole dataset rather than only that it failed.
+
+Comparison configuration is inferred from the model, so there is nothing to
+annotate. Pass `model_cls` for a single-schema suite and any foreign shape raises;
+omit it and the class is inferred per case, with `metrics()` partitioned by class.
+
+Requires the `stickler` extra:
+
+```bash
+pip install "strands-agents-evals[stickler]"
+```
+
 ### Tool Usage and Parameter Evaluation
 
 Evaluate specific aspects of tool usage with specialized evaluators:
@@ -611,6 +668,7 @@ These evaluators work directly with inputs and outputs without requiring OpenTel
 - **OutputEvaluator**: Flexible LLM-based evaluation with custom rubrics
 - **TrajectoryEvaluator**: Action sequence evaluation with built-in scoring tools (supports both list-based trajectories and Session traces via extractors)
 - **InteractionsEvaluator**: Multi-agent interaction and handoff evaluation
+- **StructuredOutput**: Field-level scoring of structured output against ground truth, with order-independent list matching and per-field metrics (requires the `stickler` extra)
 - **Custom Evaluators**: Extensible base class for domain-specific logic
 
 ### Trace-Based Evaluators
