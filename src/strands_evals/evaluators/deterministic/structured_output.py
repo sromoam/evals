@@ -51,8 +51,50 @@ class _CaseResult:
     model_cls: type
     overall_score: float
     matched: bool
+    test_pass: bool
+    # Computed by stickler alongside the score. Unlike `overall_score` these ignore
+    # correct absence, so they stay meaningful on a sparse schema; `recall` is the
+    # one `test_pass` gates on.
+    precision: float | None = None
+    recall: float | None = None
+    f1: float | None = None
     field_scores: dict[str, float] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict)
+
+
+def _passed(result: Any, match_threshold: float) -> bool:
+    """Whether a case passes: the score cleared the bar AND the real values were found.
+
+    `result.matched` alone is not enough. It is `overall_score >= match_threshold`, and
+    `overall_score` credits a field absent on *both* sides with 1.0 at full weight -- a
+    value the model correctly left blank is a value it got right. On a sparse extraction
+    schema, which is the common case, those uninformative fields outvote the informative
+    ones, so a prediction that found *nothing* can clear the threshold:
+
+        10 optional fields, 2 populated in ground truth, prediction returns nothing
+        -> overall_score 0.80, matched True, recall 0.00
+
+    and it gets worse as the schema widens, so raising `match_threshold` cannot fix it:
+    the threshold required tends to 1.0 as the optional tail grows.
+
+    Recall closes it. Recall counts only fields that had a value to find, so correct
+    absence neither helps nor hurts it, and it reads 0.0 for a blank extraction. This is
+    what stickler's own guidance recommends gating on for sparse schemas:
+    https://awslabs.github.io/stickler/Getting-Started/thresholds-and-metrics/#sparse-objects
+
+    When there was nothing to find at all, the score verdict stands on its own -- two
+    genuinely empty objects are a match, not a failure. That case is detected as
+    `tp + fn == 0` rather than by a null recall: stickler reports recall as 0.0, not
+    None, when the denominator is empty, so gating on recall alone would fail a document
+    whose ground truth was legitimately blank.
+    """
+    if not bool(result.matched):
+        return False
+    overall = (result.raw or {}).get("confusion_matrix", {}).get("overall", {})
+    findable = overall.get("tp", 0) + overall.get("fn", 0)
+    if findable == 0:
+        return True
+    return result.recall is not None and result.recall >= match_threshold
 
 
 def _distinct_names(classes: Mapping[type, Any]) -> dict[type, str]:
@@ -130,7 +172,11 @@ class StructuredOutput(Evaluator[InputT, OutputT]):
             per case and `metrics` partitions its rollup by class, so a suite mixing
             output types stays readable.
         match_threshold: Similarity at or above which an object counts as a match.
-            Drives `test_pass` and the per-element matching of `list[Model]` fields.
+            Drives the per-element matching of `list[Model]` fields, and one half of
+            `test_pass`. A case passes when the weighted score clears this AND recall
+            does, because the score alone credits fields absent on both sides and so
+            would pass a prediction that found nothing on a sparse schema. See
+            `_passed`.
         weight_hints: When True, weight fields by name-based importance heuristics
             (ids and amounts count for more). Off by default so weights stay uniform
             and metrics are not skewed by guessed business criticality.
@@ -196,12 +242,17 @@ class StructuredOutput(Evaluator[InputT, OutputT]):
         # and they need `field_comparisons` alongside it. Keeping it without them
         # makes aggregate_from_comparisons warn on every call, and it is the
         # bulkiest part of the result. field_metrics is identical without it.
+        passed = _passed(result, self.match_threshold)
         self._results.append(
             _CaseResult(
                 name=evaluation_case.name,
                 model_cls=cls,
                 overall_score=result.overall_score,
                 matched=result.matched,
+                test_pass=passed,
+                precision=result.precision,
+                recall=result.recall,
+                f1=result.f1,
                 field_scores=dict(result.field_scores),
                 raw={k: v for k, v in result.raw.items() if k != "prediction_raw"},
             )
@@ -218,7 +269,9 @@ class StructuredOutput(Evaluator[InputT, OutputT]):
         return [
             EvaluationOutput(
                 score=result.overall_score,
-                test_pass=result.matched,
+                # Not `result.matched` alone: that credits absent-on-both fields, so a
+                # blank extraction passes on a sparse schema. See `_passed`.
+                test_pass=passed,
                 reason=self._weakest(result.field_scores),
                 # The model class, so a mixed-schema run can be grouped by output
                 # type. Two caveats worth knowing. `EvaluationOutput.label` is
@@ -278,8 +331,10 @@ class StructuredOutput(Evaluator[InputT, OutputT]):
         the two can differ in length as well as order. Join on `case` instead.
 
         Returns:
-            One entry per case with `case`, `model`, `overall_score`, `matched` and
-            `field_scores`.
+            One entry per case with `case`, `model`, `overall_score`, `test_pass`,
+            `matched`, `precision`, `recall`, `f1` and `field_scores`. On a sparse
+            schema read `recall` or `f1` rather than `overall_score`: the score credits
+            fields absent on both sides, those three do not.
         """
         keys = _distinct_names({case.model_cls: None for case in self._results})
         return [
@@ -287,7 +342,16 @@ class StructuredOutput(Evaluator[InputT, OutputT]):
                 "case": case.name,
                 "model": keys[case.model_cls],
                 "overall_score": case.overall_score,
+                # `test_pass` is the verdict the harness reported. `matched` is
+                # stickler's score-only view, kept because it is the number the
+                # `overall_score` column is thresholded against; the two differ
+                # exactly when correct absence carried a prediction that found
+                # nothing. See `_passed`.
+                "test_pass": case.test_pass,
                 "matched": case.matched,
+                "precision": case.precision,
+                "recall": case.recall,
+                "f1": case.f1,
                 "field_scores": dict(case.field_scores),
             }
             for case in list(self._results)

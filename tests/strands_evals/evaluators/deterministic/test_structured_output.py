@@ -431,3 +431,104 @@ class TestExplain:
     def test_needs_a_model(self):
         with pytest.raises(RuntimeError, match="needs a model"):
             StructuredOutput().explain()
+
+
+class SparseInvoice(BaseModel):
+    """The common extraction shape: two fields that matter, a long optional tail.
+
+    `overall_score` credits a field absent on both sides with 1.0 at full weight, so
+    the tail dominates the mean. These fields exist to make that measurable.
+    """
+
+    invoice_id: str
+    vendor_name: str
+    invoice_date: str | None = None
+    total_amount: float | None = None
+    tax_amount: float | None = None
+    po_number: str | None = None
+    payment_terms: str | None = None
+    shipping_address: str | None = None
+    billing_address: str | None = None
+    notes: str | None = None
+
+
+class TestPassRequiresFindingSomething:
+    """`test_pass` gates on recall as well as the score.
+
+    Every test here fails against a `test_pass = result.matched` implementation, and
+    against stickler 0.7.0 where `matched` meant all-fields-AND. They are what makes
+    the `stickler-eval>=1.0.0` floor in pyproject.toml mean something.
+    """
+
+    def test_a_prediction_that_found_nothing_does_not_pass(self):
+        """The defect this gate exists for.
+
+        Ground truth has 2 of 10 fields; the agent returns nothing. The 8 fields blank
+        on both sides each score 1.0, so the mean is 0.80 and clears the 0.7 default
+        while recall is 0.00. Passing here would tell a CI gate that an agent which
+        extracted nothing is fine.
+        """
+        gt = SparseInvoice(invoice_id="INV-8842", vendor_name="Acme Corporation")
+        blank = SparseInvoice(invoice_id="", vendor_name="")
+
+        evaluator = StructuredOutput(SparseInvoice)
+        outputs = evaluator.evaluate(_data(gt, blank))
+
+        assert outputs[0].score > 0.7, "the score really does clear the threshold"
+        assert outputs[0].test_pass is False, "but nothing was found, so it must not pass"
+
+        entry = evaluator.per_case()[0]
+        assert entry["recall"] == 0.0
+        assert entry["matched"] is True, "stickler's score-only verdict still says match"
+        assert entry["test_pass"] is False, "the evaluator's verdict disagrees, correctly"
+
+    def test_widening_the_optional_tail_does_not_buy_a_pass(self):
+        """Severity scales with schema width, so a higher threshold cannot fix it.
+
+        The blank-prediction score is the blank fraction of the schema, which tends to
+        1.0 as the optional tail grows. Only a recall gate is stable under that.
+        """
+        gt = SparseInvoice(invoice_id="INV-1", vendor_name="Acme")
+        blank = SparseInvoice(invoice_id="", vendor_name="")
+
+        for threshold in (0.7, 0.75, 0.8):
+            evaluator = StructuredOutput(SparseInvoice, match_threshold=threshold)
+            outputs = evaluator.evaluate(_data(gt, blank))
+            assert outputs[0].test_pass is False, f"blank passed at threshold {threshold}"
+
+    def test_a_good_extraction_still_passes(self):
+        """The gate must not cost a correct sparse extraction its pass."""
+        gt = SparseInvoice(invoice_id="INV-8842", vendor_name="Acme Corporation")
+
+        evaluator = StructuredOutput(SparseInvoice)
+        outputs = evaluator.evaluate(_data(gt, gt.model_copy()))
+
+        assert outputs[0].test_pass is True
+        assert evaluator.per_case()[0]["recall"] == 1.0
+
+    def test_nothing_to_find_is_a_pass_not_a_failure(self):
+        """A document whose ground truth is legitimately blank.
+
+        stickler reports recall as 0.0 rather than None when the denominator is empty,
+        so a naive recall gate would fail this. The guard reads `tp + fn == 0` instead.
+        """
+
+        class AllOptional(BaseModel):
+            a: str | None = None
+            b: str | None = None
+
+        evaluator = StructuredOutput(AllOptional)
+        outputs = evaluator.evaluate(_data(AllOptional(), AllOptional()))
+
+        assert outputs[0].score == 1.0
+        assert outputs[0].test_pass is True
+
+    def test_per_case_exposes_the_metrics_the_verdict_rests_on(self):
+        """recall/precision/f1 come from the retained comparison, not a second pass."""
+        gt = SparseInvoice(invoice_id="INV-1", vendor_name="Acme")
+        evaluator = StructuredOutput(SparseInvoice)
+        evaluator.evaluate(_data(gt, gt.model_copy()))
+
+        entry = evaluator.per_case()[0]
+        for key in ("test_pass", "matched", "precision", "recall", "f1"):
+            assert key in entry, f"per_case() should expose {key}"
