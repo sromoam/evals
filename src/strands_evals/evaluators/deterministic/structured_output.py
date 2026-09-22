@@ -2,10 +2,10 @@
 
 `Equals` compares structured output with whole-object `==`, scoring 0.0 or 1.0. An
 extraction that gets nine of ten fields right is indistinguishable from one that
-gets none right, and a reordered list counts as wrong. `StructuredOutput` compares
-field by field with type-aware comparators, order-independent list matching and
-per-field thresholds, so the score reflects how wrong the output is and names which
-field to fix.
+gets none right, and a reordered list counts as wrong. `StructuredOutputSimilarity`
+compares field by field with type-aware comparators, order-independent list matching
+and per-field thresholds, so the score reflects how wrong the output is and names
+which field to fix.
 
 Deterministic and offline: no LLM judge, no credentials, no per-call cost.
 
@@ -16,50 +16,66 @@ pip install "strands-agents-evals[stickler]"
 ```
 """
 
+import importlib
 import logging
-from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
-from ...types.evaluation import EvaluationData, EvaluationOutput, InputT, OutputT
+from ...types.evaluation import NOT_APPLICABLE, EvaluationData, EvaluationOutput, InputT, OutputT
+from ...types.evaluation_report import EvaluationReport
 from ..evaluator import Evaluator
 
 logger = logging.getLogger(__name__)
 
-# optional extra: stickler-eval
-try:
-    from stickler import aggregate_from_comparisons, eval_for
 
-    _STICKLER_AVAILABLE = True
-    _IMPORT_ERROR: ImportError | None = None
-except ImportError as exc:  # pragma: no cover - exercised by the extras gate
-    _STICKLER_AVAILABLE = False
-    _IMPORT_ERROR = exc
+def _stickler() -> tuple[Any, Any]:
+    """Import stickler on demand, with a directed error when the extra is missing.
 
+    Imported lazily rather than at module scope: stickler costs ~450ms to import and
+    `deterministic/__init__` puts this module on the `import strands_evals` path, so an
+    eager import charges that to everyone with the extra installed.
 
-@dataclass(frozen=True)
-class _CaseResult:
-    """What one comparison produced, kept for reading after the run.
+    Returns:
+        The `eval_for` and `aggregate_from_comparisons` callables.
 
-    `EvaluationOutput` carries four scalars, so it cannot express a per-field
-    breakdown. Keeping the comparison here instead means `per_case` can return the
-    real numbers rather than a reconstruction.
+    Raises:
+        ImportError: If the `stickler` extra is not installed.
     """
+    try:
+        # optional extra: stickler-eval
+        from stickler import aggregate_from_comparisons, eval_for
+    except ImportError as exc:
+        raise ImportError(
+            "StructuredOutputSimilarity requires the 'stickler-eval' package. Install "
+            'it with: pip install "strands-agents-evals[stickler]"'
+        ) from exc
+    return eval_for, aggregate_from_comparisons
 
-    name: str | None
-    model_cls: type
-    overall_score: float
-    matched: bool
-    test_pass: bool
-    # Computed by stickler alongside the score. Unlike `overall_score` these ignore
-    # correct absence, so they stay meaningful on a sparse schema; `recall` is the
-    # one `test_pass` gates on.
-    precision: float | None = None
-    recall: float | None = None
-    f1: float | None = None
-    field_scores: dict[str, float] = field(default_factory=dict)
-    raw: dict[str, Any] = field(default_factory=dict)
+
+def _resolve_model_cls(model_cls: type[BaseModel] | str) -> type[BaseModel]:
+    """Accept a model class or the dotted path `to_dict` emits for it.
+
+    Args:
+        model_cls: The Pydantic model class, or `module.QualName` naming it.
+
+    Returns:
+        The model class.
+
+    Raises:
+        TypeError: If the value is neither a Pydantic model class nor a dotted path to one.
+    """
+    if isinstance(model_cls, str):
+        module_name, _, qual_name = model_cls.rpartition(".")
+        if not module_name:
+            raise TypeError(f"model_cls string must be a dotted path like 'myapp.models.Invoice'; got {model_cls!r}")
+        resolved: Any = importlib.import_module(module_name)
+        for part in qual_name.split("."):
+            resolved = getattr(resolved, part)
+        model_cls = resolved
+    if not (isinstance(model_cls, type) and issubclass(model_cls, BaseModel)):
+        raise TypeError(f"model_cls must be a Pydantic model class; got {model_cls!r}")
+    return model_cls
 
 
 def _passed(result: Any, match_threshold: float) -> bool:
@@ -74,22 +90,20 @@ def _passed(result: Any, match_threshold: float) -> bool:
         10 optional fields, 2 populated in ground truth, prediction returns nothing
         -> overall_score 0.80, matched True, recall 0.00
 
-    and it gets worse as the schema widens, so raising `match_threshold` cannot fix it:
-    the threshold required tends to 1.0 as the optional tail grows.
-
-    Recall closes it. Recall counts only fields that had a value to find, so correct
-    absence neither helps nor hurts it, and it reads 0.0 for a blank extraction. This is
-    what stickler's own guidance recommends gating on for sparse schemas:
+    and it gets worse as the schema widens, so raising `match_threshold` cannot fix it.
+    Recall counts only fields that had a value to find, so correct absence neither helps
+    nor hurts it. This is what stickler recommends gating on for sparse schemas:
     https://awslabs.github.io/stickler/Getting-Started/thresholds-and-metrics/#sparse-objects
 
-    When there was nothing to find at all, the score verdict stands on its own -- two
-    genuinely empty objects are a match, not a failure. That case is detected as
-    `tp + fn == 0` rather than by a null recall: stickler reports recall as 0.0, not
-    None, when the denominator is empty, so gating on recall alone would fail a document
-    whose ground truth was legitimately blank.
+    Two genuinely empty objects are a match, not a failure. That case is detected as
+    `tp + fn == 0` rather than by a null recall: stickler reports recall as 0.0, not None,
+    when the denominator is empty, so gating on recall alone would fail a document whose
+    ground truth was legitimately blank.
     """
     if not bool(result.matched):
         return False
+    # `raw["confusion_matrix"]` is stickler's own result shape rather than a documented
+    # accessor; pinned safe by the `<2.0.0` bound on the extra.
     overall = (result.raw or {}).get("confusion_matrix", {}).get("overall", {})
     findable = overall.get("tp", 0) + overall.get("fn", 0)
     if findable == 0:
@@ -97,129 +111,98 @@ def _passed(result: Any, match_threshold: float) -> bool:
     return result.recall is not None and result.recall >= match_threshold
 
 
-def _distinct_names(classes: Mapping[type, Any]) -> dict[type, str]:
-    """Map each class to a display name, unique within this set.
-
-    Keyed on `__name__` normally, because that is what a caller wants to read. Two
-    distinct classes can share a name, though -- two modules each defining an
-    `Invoice` is ordinary -- and a plain `__name__` key silently collapses them,
-    with the later one overwriting the earlier rollup entirely rather than merging
-    it.
-
-    Colliding names fall back to `module.QualName`, then to a numeric suffix. The
-    second fallback is not paranoia: classes built with `type()` in one module,
-    which is how dynamic models are made, share both `__module__` and
-    `__qualname__`, so qualifying alone does not separate them.
+def _rows(report: EvaluationReport, evaluator: str | None) -> Iterator[tuple[Mapping[str, Any], EvaluationOutput]]:
+    """Yield `(case, row)` pairs from a report, optionally for one evaluator only.
 
     Args:
-        classes: The classes to name, used as a set via its keys.
+        report: The report to read.
+        evaluator: Evaluator name to filter on, matched against `cases[i]["evaluator"]`.
+            None reads every row, which is what a single-evaluator report wants.
 
-    Returns:
-        A mapping from class to display name, unique across the input.
+    Yields:
+        One pair per `EvaluationOutput` in the report.
     """
-    ordered = list(classes)
-
-    def bucket(key_of: Any) -> dict[str, int]:
-        counts: dict[str, int] = {}
-        for cls in ordered:
-            counts[key_of(cls)] = counts.get(key_of(cls), 0) + 1
-        return counts
-
-    plain = bucket(lambda c: c.__name__)
-    qualified = bucket(lambda c: f"{c.__module__}.{c.__qualname__}")
-
-    names: dict[type, str] = {}
-    seen: dict[str, int] = {}
-    for cls in ordered:
-        if plain[cls.__name__] == 1:
-            name = cls.__name__
-        else:
-            name = f"{cls.__module__}.{cls.__qualname__}"
-            if qualified[name] > 1:
-                seen[name] = seen.get(name, 0) + 1
-                name = f"{name}#{seen[name]}"
-        names[cls] = name
-    return names
+    for index, rows in enumerate(report.detailed_results):
+        case: Mapping[str, Any] = report.cases[index] if index < len(report.cases) else {}
+        if evaluator is not None and case.get("evaluator") != evaluator:
+            continue
+        for row in rows:
+            yield case, row
 
 
-def _require_stickler() -> None:
-    """Raise a directed ImportError when the optional extra is missing."""
-    if not _STICKLER_AVAILABLE:
-        raise ImportError(
-            "StructuredOutput requires the 'stickler-eval' package. Install it "
-            'with: pip install "strands-agents-evals[stickler]"'
-        ) from _IMPORT_ERROR
-
-
-class StructuredOutput(Evaluator[InputT, OutputT]):
+class StructuredOutputSimilarity(Evaluator[InputT, OutputT]):
     """Scores structured output against ground truth, field by field.
 
     Comparison configuration is inferred from the Pydantic model itself -- the same
     model the agent already passes as `structured_output_model` -- so no schema or
-    annotation work is required. Every inferred decision is inspectable via
-    `explain`.
+    annotation work is required. Every inferred decision is inspectable via `explain`.
 
-    Returns one `EvaluationOutput` per case, carrying the weighted overall score.
-    Field-level detail is read from the evaluator rather than squeezed through that
-    type, which has only four scalar fields: `per_case` for per-document field
-    scores, `metrics` for the dataset-wide confusion matrix. Both read comparisons
-    already performed, so neither runs anything twice.
+    Returns one `EvaluationOutput` per case. The weighted score is on `score`, and the
+    field-level detail rides on `metadata`, which keeps it in the report rather than on
+    this instance: `metadata["field_scores"]` per document, plus `precision`, `recall`,
+    `f1`, and the raw `comparison` that `metrics` aggregates. `metrics` and `per_case`
+    are therefore functions of a report, and survive `report.model_dump_json()`.
 
     Args:
-        model_cls: The Pydantic model the agent emits. Optional. When given, every
-            case is coerced to it and anything that will not validate raises, which
-            is what a single-schema suite wants. When omitted, the class is inferred
-            per case and `metrics` partitions its rollup by class, so a suite mixing
-            output types stays readable.
+        model_cls: The Pydantic model the agent emits. Also accepts the dotted path
+            `to_dict` writes, so a saved experiment reloads.
         match_threshold: Similarity at or above which an object counts as a match.
             Drives the per-element matching of `list[Model]` fields, and one half of
             `test_pass`. A case passes when the weighted score clears this AND recall
             does, because the score alone credits fields absent on both sides and so
-            would pass a prediction that found nothing on a sparse schema. See
-            `_passed`.
+            would pass a prediction that found nothing on a sparse schema. See `_passed`.
         weight_hints: When True, weight fields by name-based importance heuristics
             (ids and amounts count for more). Off by default so weights stay uniform
             and metrics are not skewed by guessed business criticality.
-        name: Optional evaluator name, forwarded to `Evaluator`.
+        name: Optional evaluator name, forwarded to `Evaluator`. Give two instances
+            distinct names to keep a mixed-schema run's rollups separate.
 
     Raises:
         ImportError: If the `stickler` extra is not installed.
+        TypeError: If `model_cls` is not a Pydantic model class or a dotted path to one.
     """
 
     def __init__(
         self,
-        model_cls: type[BaseModel] | None = None,
+        model_cls: type[BaseModel] | str,
         *,
         match_threshold: float = 0.7,
         weight_hints: bool = False,
         name: str | None = None,
     ) -> None:
         """Initialize the evaluator. See the class docstring for argument detail."""
-        _require_stickler()
         super().__init__(name=name)
-        self.declared_cls = model_cls
+        eval_for, _ = _stickler()
+        self._model_cls = _resolve_model_cls(model_cls)
         self.match_threshold = match_threshold
         self.weight_hints = weight_hints
+        # Built here, not per case, so a model stickler cannot handle (a self-referencing
+        # one, for instance) raises at construction instead of failing every case.
+        self._spec = eval_for(
+            self._model_cls,
+            match_threshold=match_threshold,
+            weight_hints=weight_hints,
+        )
 
-        self._specs: dict[type, Any] = {}
-        # One _CaseResult per evaluated case. Appended to and never read during a
-        # run. `list.append` is atomic under the GIL, so this needs no lock even
-        # though the harness calls evaluate() from up to `max_workers` threads via
-        # asyncio.to_thread (default 10). Everything is read afterwards, on one
-        # thread, by metrics() and per_case().
-        #
-        # Append-only is a correctness argument, not a measured one: a
-        # read-modify-write mutant of this line did NOT lose results across 1000
-        # cases at 32 workers on CPython 3.12, so a race test cannot stand in for
-        # it. `test_the_accumulator_is_append_only` pins the structure instead.
-        #
-        # `evaluate_async` is deliberately NOT overridden. The base class's is
-        # `await asyncio.to_thread(self.evaluate, ...)`, which is what puts this on
-        # worker threads at all; a synchronous override would run the comparison
-        # inline on the event loop, making the sentence above false and the
-        # concurrency test vacuous, and would block every other case's task on a
-        # CPU-bound Hungarian match.
-        self._results: list[_CaseResult] = []
+    @property
+    def model_cls(self) -> type[BaseModel]:
+        """The Pydantic model every case is compared as.
+
+        Stored privately so the base `to_dict()` skips it; `to_dict()` below re-adds it
+        as a dotted path, which is what survives a JSON round-trip.
+        """
+        return self._model_cls
+
+    def to_dict(self) -> dict:
+        """Convert the evaluator into a dictionary.
+
+        Returns:
+            dict: The evaluator's information, with `model_cls` as a dotted path so the
+            result is JSON-serializable and `from_dict` can resolve it back.
+        """
+        _dict = super().to_dict()
+        _dict["model_cls"] = f"{self._model_cls.__module__}.{self._model_cls.__qualname__}"
+        return _dict
 
     def evaluate(self, evaluation_case: EvaluationData[InputT, OutputT]) -> list[EvaluationOutput]:
         """Compare one case's actual output against its expected output.
@@ -228,40 +211,46 @@ class StructuredOutput(Evaluator[InputT, OutputT]):
             evaluation_case: The case to score.
 
         Returns:
-            A single-element list carrying the weighted score for the case.
+            A single-element list carrying the weighted score and, on `metadata`, the
+            per-field detail. A case with no `expected_output` returns a
+            `NOT_APPLICABLE` row; output that will not validate returns a score-0 row
+            naming why, rather than raising.
         """
-        cls = self._resolve_cls(evaluation_case)
-        spec = self._spec_for(cls)
+        name = self._model_cls.__name__
+        if evaluation_case.expected_output is None:
+            return [
+                EvaluationOutput(
+                    score=0.0,
+                    test_pass=True,
+                    reason="expected_output is None, so there was no ground truth to compare against",
+                    label=NOT_APPLICABLE,
+                )
+            ]
 
-        expected = self._coerce(evaluation_case.expected_output, cls, "expected_output")
-        actual = self._coerce(evaluation_case.actual_output, cls, "actual_output")
+        try:
+            expected = self._coerce(evaluation_case.expected_output, "expected_output")
+            actual = self._coerce(evaluation_case.actual_output, "actual_output")
+        except (ValidationError, TypeError) as exc:
+            # A prediction that will not validate is a real evaluation failure, not an
+            # evaluator crash. Returning a row keeps the report and the rollup in step.
+            logger.debug("case=<%s>, model=<%s> | output did not validate", evaluation_case.name, name)
+            return [
+                EvaluationOutput(
+                    score=0.0,
+                    test_pass=False,
+                    reason=f"could not compare as {name}: {exc}",
+                    label=name,
+                    metadata={"error": "validation_failed"},
+                )
+            ]
 
-        result = spec.evaluate(expected, actual)
-
-        # `prediction_raw` is dropped: only the confidence accumulators consume it,
-        # and they need `field_comparisons` alongside it. Keeping it without them
-        # makes aggregate_from_comparisons warn on every call, and it is the
-        # bulkiest part of the result. field_metrics is identical without it.
+        result = self._spec.evaluate(expected, actual)
         passed = _passed(result, self.match_threshold)
-        self._results.append(
-            _CaseResult(
-                name=evaluation_case.name,
-                model_cls=cls,
-                overall_score=result.overall_score,
-                matched=result.matched,
-                test_pass=passed,
-                precision=result.precision,
-                recall=result.recall,
-                f1=result.f1,
-                field_scores=dict(result.field_scores),
-                raw={k: v for k, v in result.raw.items() if k != "prediction_raw"},
-            )
-        )
 
         logger.debug(
             "case=<%s>, model=<%s>, score=<%.4f>, matched=<%s> | scored structured output",
             evaluation_case.name,
-            cls.__name__,
+            name,
             result.overall_score,
             result.matched,
         )
@@ -273,162 +262,116 @@ class StructuredOutput(Evaluator[InputT, OutputT]):
                 # blank extraction passes on a sparse schema. See `_passed`.
                 test_pass=passed,
                 reason=self._weakest(result.field_scores),
-                # The model class, so a mixed-schema run can be grouped by output
-                # type. Two caveats worth knowing. `EvaluationOutput.label` is
-                # documented as the categorical label for the score, and the
-                # harness derives its own span label from the score independently,
-                # so the two describe different things. And this is the raw
-                # `__name__`, while `per_case` and `metrics` use the disambiguated
-                # name: with two same-named classes the label cannot be joined
-                # back to its rollup. The disambiguated name is not available here
-                # because it depends on which classes appear across the whole run,
-                # which is not known until the run ends.
-                label=cls.__name__,
+                label=name,
+                metadata={
+                    "field_scores": dict(result.field_scores),
+                    # Unlike the score, these ignore correct absence, so they stay
+                    # meaningful on a sparse schema; `recall` is what `test_pass` gates on.
+                    "precision": result.precision,
+                    "recall": result.recall,
+                    "f1": result.f1,
+                    "matched": result.matched,
+                    # `prediction_raw` is dropped: only the confidence accumulators read
+                    # it, they need `field_comparisons` alongside it, and it is the
+                    # bulkiest part of the result. field_metrics is identical without it.
+                    "comparison": {k: v for k, v in result.raw.items() if k != "prediction_raw"},
+                },
             )
         ]
 
-    def metrics(self) -> dict[str, Any]:
-        """Per-field metrics across every case evaluated so far.
+    @staticmethod
+    def metrics(report: EvaluationReport, *, evaluator: str | None = None) -> Any:
+        """Per-field metrics across every case in a report.
 
-        Keyed by model class name, so a suite mixing output types gets one rollup
-        per type. Feeding two schemas into a single rollup unions their field paths,
-        which makes a field present in half the documents read as missed in the rest.
+        A pure function of the report, so it is index-aligned with the cases, includes
+        the rows a failed case produced, and works on a report reloaded from JSON.
 
-        Each value carries a `field_metrics` mapping keyed by dotted path
-        (`line_items.sku`) with the five-category counts (tp/tn/fn/fa/fd) plus
-        precision, recall, F1 and accuracy.
-
-        Read after the run. A nested path's counts only cover documents whose parent
-        pair scored at or above `match_threshold`: below that, threshold gating
-        treats the pair as atomic and emits no field breakdown, so a nested field
-        has a smaller denominator than the document count.
-
-        Returns:
-            One rollup per model class, keyed by display name.
-        """
-        by_cls: dict[type, list[dict[str, Any]]] = {}
-        for case in list(self._results):
-            by_cls.setdefault(case.model_cls, []).append(case.raw)
-        keys = _distinct_names(by_cls)
-        return {keys[cls]: aggregate_from_comparisons(raws) for cls, raws in by_cls.items()}
-
-    def per_case(self) -> list[Mapping[str, Any]]:
-        """Per-document field scores, in the order the cases completed.
-
-        `EvaluationOutput` has four scalar fields, so the harness's
-        `report.detailed_results` can only ever echo what `evaluate` returned.
-        Reading from the retained comparison instead means the real per-field
-        numbers are available without squeezing them through that shape, and
-        without a second comparison pass.
-
-        Nested list children are absent from `field_scores` because no per-leaf
-        score is emitted for them; use `metrics` for those, which reports their
-        counts and precision/recall/F1.
-
-        Do NOT positionally zip this with `report.scores`. That is index-ordered
-        while this is completion-ordered, and the harness records a failed
-        evaluator as a zero-score row without `evaluate` ever appending here, so
-        the two can differ in length as well as order. Join on `case` instead.
+        Args:
+            report: The report to aggregate.
+            evaluator: Evaluator name to filter on, for a run carrying more than one
+                evaluator. None aggregates every row that has a comparison. Pass this
+                when two instances scored different schemas: feeding two schemas into
+                one rollup unions their field paths, which makes a field present in half
+                the documents read as missed in the rest.
 
         Returns:
-            One entry per case with `case`, `model`, `overall_score`, `test_pass`,
-            `matched`, `precision`, `recall`, `f1` and `field_scores`. On a sparse
-            schema read `recall` or `f1` rather than `overall_score`: the score credits
-            fields absent on both sides, those three do not.
+            stickler's `ProcessEvaluation`, whose `field_metrics` is keyed by dotted path
+            (`line_items.sku`) with the five-category counts (tp/tn/fn/fa/fd) plus
+            precision, recall, F1 and accuracy.
+
+            A nested path's counts only cover documents whose parent pair scored at or
+            above `match_threshold`: below that, threshold gating treats the pair as
+            atomic and emits no field breakdown, so a nested field has a smaller
+            denominator than the document count. Cases whose output never validated
+            carry no comparison, so they are absent here while still appearing in the
+            report as score-0 rows.
         """
-        keys = _distinct_names({case.model_cls: None for case in self._results})
+        _, aggregate_from_comparisons = _stickler()
+        comparisons = [
+            row.metadata["comparison"]
+            for _, row in _rows(report, evaluator)
+            if row.metadata and "comparison" in row.metadata
+        ]
+        return aggregate_from_comparisons(comparisons)
+
+    @staticmethod
+    def per_case(report: EvaluationReport, *, evaluator: str | None = None) -> list[Mapping[str, Any]]:
+        """Per-document field scores, in case order.
+
+        A flat table, for printing or loading into a dataframe. Reads the same
+        `metadata` the report already carries, so it runs no comparison of its own.
+
+        Nested list children are absent from `field_scores` because no per-leaf score is
+        emitted for them; use `metrics` for those, which reports their counts and
+        precision/recall/F1.
+
+        Args:
+            report: The report to read.
+            evaluator: Evaluator name to filter on. None reads every row that has field
+                scores.
+
+        Returns:
+            One entry per scored case with `case`, `model`, `overall_score`, `test_pass`,
+            `matched`, `precision`, `recall`, `f1` and `field_scores`. On a sparse schema
+            read `recall` or `f1` rather than `overall_score`: the score credits fields
+            absent on both sides, those three do not. Cases whose output never validated
+            are omitted; they appear in the report as score-0 rows.
+        """
         return [
             {
-                "case": case.name,
-                "model": keys[case.model_cls],
-                "overall_score": case.overall_score,
-                # `test_pass` is the verdict the harness reported. `matched` is
-                # stickler's score-only view, kept because it is the number the
-                # `overall_score` column is thresholded against; the two differ
-                # exactly when correct absence carried a prediction that found
-                # nothing. See `_passed`.
-                "test_pass": case.test_pass,
-                "matched": case.matched,
-                "precision": case.precision,
-                "recall": case.recall,
-                "f1": case.f1,
-                "field_scores": dict(case.field_scores),
+                "case": case.get("name"),
+                "model": row.label,
+                "overall_score": row.score,
+                "test_pass": row.test_pass,
+                # `test_pass` is the verdict the harness reported. `matched` is stickler's
+                # score-only view; the two differ exactly when correct absence carried a
+                # prediction that found nothing. See `_passed`.
+                "matched": row.metadata["matched"],
+                "precision": row.metadata["precision"],
+                "recall": row.metadata["recall"],
+                "f1": row.metadata["f1"],
+                "field_scores": dict(row.metadata["field_scores"]),
             }
-            for case in list(self._results)
+            for case, row in _rows(report, evaluator)
+            if row.metadata and "field_scores" in row.metadata
         ]
-
-    def reset(self) -> None:
-        """Drop accumulated results.
-
-        Evaluator instances are shared across cases and may be reused across
-        experiments, so a stateful evaluator needs an explicit way to clear.
-
-        Clears the inferred-spec cache as well as the results. Keeping the specs
-        meant `explain()` still raised "ambiguous across 2 inferred schemas" after a
-        reset, naming a class that contributed nothing to the current results.
-        """
-        self._results.clear()
-        self._specs.clear()
 
     def explain(self) -> dict[str, dict[str, Any]]:
         """Per-field comparison config and why it was chosen.
 
-        Keyed by dotted path, so nested decisions are auditable too.
+        Configuration rather than results: derived from the model class alone, so it
+        reads the same before and after a run. Keyed by dotted path, so nested decisions
+        are auditable too.
 
         Returns:
-            One entry per field path, carrying the comparator, threshold, weight and
-            the provenance of each choice.
-
-        Raises:
-            RuntimeError: If no model is available, or if several inferred schemas
-                make the answer ambiguous.
+            One entry per field path, carrying the comparator, threshold, weight and the
+            provenance of each choice.
         """
-        if self.declared_cls is not None:
-            return self._spec_for(self.declared_cls).explain()
-        if not self._specs:
-            raise RuntimeError(
-                "explain() needs a model: pass model_cls to the constructor, or evaluate at least one case first."
-            )
-        if len(self._specs) > 1:
-            names = ", ".join(sorted(c.__name__ for c in self._specs))
-            raise RuntimeError(
-                f"explain() is ambiguous across {len(self._specs)} inferred schemas "
-                f"({names}). Pass model_cls to select one."
-            )
-        return next(iter(self._specs.values())).explain()
+        return self._spec.explain()
 
-    def _resolve_cls(self, evaluation_case: EvaluationData[InputT, OutputT]) -> type[BaseModel]:
-        if self.declared_cls is not None:
-            return self.declared_cls
-        # expected_output first, deliberately. Ground truth defines the fields being
-        # measured; the agent's output does not get to narrow that. If it is
-        # inferred from `actual_output` instead, an agent returning a model with
-        # fewer fields silently drops the missing ones from the comparison and
-        # scores 1.0 -- a perfect result for output that omitted a field, which is
-        # the exact failure this evaluator exists to catch. Preferring expected
-        # makes `_coerce` raise on that input instead.
-        for value in (evaluation_case.expected_output, evaluation_case.actual_output):
-            if isinstance(value, BaseModel):
-                return type(value)
-        raise TypeError(
-            f"{type(self).__name__} could not infer a model class from this case. Pass "
-            f"model_cls to the constructor, or supply outputs as Pydantic model "
-            f"instances rather than dicts or JSON strings."
-        )
-
-    def _spec_for(self, cls: type[BaseModel]) -> Any:
-        spec = self._specs.get(cls)
-        if spec is None:
-            spec = eval_for(
-                cls,
-                match_threshold=self.match_threshold,
-                weight_hints=self.weight_hints,
-            )
-            self._specs[cls] = spec
-        return spec
-
-    def _coerce(self, value: Any, cls: type[BaseModel], which: str) -> BaseModel:
+    def _coerce(self, value: Any, which: str) -> BaseModel:
         """Accept a model instance, a dict, or a JSON string."""
+        cls = self._model_cls
         if isinstance(value, cls):
             return value
         if isinstance(value, BaseModel):
@@ -438,10 +381,7 @@ class StructuredOutput(Evaluator[InputT, OutputT]):
             return cls.model_validate(value)
         if isinstance(value, str):
             return cls.model_validate_json(value)
-        raise TypeError(
-            f"{type(self).__name__} needs {which} as a {cls.__name__} instance, dict, "
-            f"or JSON string; got {type(value).__name__}"
-        )
+        raise TypeError(f"{which} must be a {cls.__name__} instance, dict, or JSON string; got {type(value).__name__}")
 
     @staticmethod
     def _weakest(field_scores: Mapping[str, float], limit: int = 4) -> str:

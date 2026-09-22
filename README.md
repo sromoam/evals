@@ -506,12 +506,12 @@ class PolicyComplianceEvaluator(Evaluator[str, str]):
 ### Field-Level Structured Output Scoring
 
 `Equals` compares structured output with whole-object `==`, so it scores 0.0 or 1.0.
-`StructuredOutput` compares field by field and tells you which field to fix.
+`StructuredOutputSimilarity` compares field by field and tells you which field to fix.
 Deterministic and offline: no LLM judge, no credentials, no per-call cost.
 
 ```python
 from pydantic import BaseModel
-from strands_evals.evaluators import StructuredOutput
+from strands_evals.evaluators import StructuredOutputSimilarity
 
 class LineItem(BaseModel):
     sku: str | None = None
@@ -524,43 +524,58 @@ class Invoice(BaseModel):
     line_items: list[LineItem] = []
 
 # The same model the agent already emits as structured_output_model.
-evaluator = StructuredOutput(Invoice)
+evaluator = StructuredOutputSimilarity(Invoice)
 report = Experiment(cases=cases, evaluators=[evaluator]).run_evaluations(task)
 
-report.overall_score      # weighted mean across the dataset
-evaluator.per_case()      # per-document field scores, plus precision/recall/f1
-evaluator.metrics()       # per-field confusion matrix, keyed by dotted path,
-                          # with cm_precision / cm_recall / cm_f1 per field
-evaluator.explain()       # the comparator chosen per field, and why
+report.overall_score                              # weighted mean across the dataset
+report.detailed_results[0][0].metadata            # this case's field scores, plus
+                                                  # precision / recall / f1
+StructuredOutputSimilarity.per_case(report)       # the same, as a flat table
+StructuredOutputSimilarity.metrics(report)        # per-field confusion matrix, keyed by
+                                                  # dotted path, with cm_precision /
+                                                  # cm_recall / cm_f1 per field
+evaluator.explain()                               # the comparator chosen per field, and why
 ```
 
 Line items that arrive in a different order are the clearest case. The content is
 identical, so the extraction is correct:
 
-| | `Equals` | `StructuredOutput` |
+| | `Equals` | `StructuredOutputSimilarity` |
 |---|---|---|
 | list reordered, content identical | `0.0` | `1.0` |
 | one quantity wrong, list reordered | `0.0` | `0.9375` |
 
 In the second row `reason` reads `weakest fields: line_items=0.75`, and
-`per_case()` gives `{'invoice_id': 1.0, 'vendor_name': 1.0, 'total_amount': 1.0,
-'line_items': 0.75}`. `metrics()` reports counts against the nested paths too --
-`line_items.sku` and `line_items.quantity` -- so a suite tells you which field
-your agent gets wrong across the whole dataset rather than only that it failed.
+`metadata["field_scores"]` gives `{'invoice_id': 1.0, 'vendor_name': 1.0,
+'total_amount': 1.0, 'line_items': 0.75}`. `metrics()` reports counts against the
+nested paths too -- `line_items.sku` and `line_items.quantity` -- so a suite tells you
+which field your agent gets wrong across the whole dataset rather than only that it
+failed.
 
-Comparison configuration is inferred from the model, so there is nothing to
-annotate. Pass `model_cls` for a single-schema suite and any foreign shape raises;
-omit it and the class is inferred per case, with `metrics()` partitioned by class.
+The field detail rides on each report row rather than on the evaluator, so it survives
+`report.model_dump_json()` and `strands-evals run --output`, and `metrics()` works on a
+report reloaded from disk:
+
+```python
+saved = EvaluationReport.model_validate_json(Path("report.json").read_text())
+StructuredOutputSimilarity.metrics(saved).field_metrics
+```
+
+Comparison configuration is inferred from the model, so there is nothing to annotate.
+`model_cls` is required, and any foreign shape scores 0 with a reason rather than
+silently coercing. For a suite mixing output types, run one evaluator per schema with
+distinct `name=` values and pass `evaluator=` to `metrics()` to read them apart.
 
 **On sparse schemas, read `recall` or `f1`, not the score alone.** `score` credits a
 field absent on *both* sides with 1.0 -- a value the model correctly left blank is a
 value it got right -- so on a schema where most fields are usually empty those fields
 outvote the informative ones. A 10-field model whose ground truth populates 2 fields
 scores `0.80` against a prediction that returned *nothing*. `test_pass` therefore
-requires both the score and `recall` to clear `match_threshold`, and `per_case()`
-exposes `recall`, `precision` and `f1` so the verdict is auditable. Raising `weight`
-on the fields you expect to be populated is the cleanest way to make `score` itself
-reflect what you care about.
+requires both the score and `recall` to clear `match_threshold`, and each row's
+`metadata` exposes `recall`, `precision` and `f1` so the verdict is auditable. To make
+`score` itself reflect the fields you care about, declare the model as a stickler
+`StructuredModel` and set `ComparableField(weight=...)` on them, or pass
+`weight_hints=True` to weight ids and amounts by name.
 
 Requires the `stickler` extra:
 
@@ -679,7 +694,7 @@ These evaluators work directly with inputs and outputs without requiring OpenTel
 - **OutputEvaluator**: Flexible LLM-based evaluation with custom rubrics
 - **TrajectoryEvaluator**: Action sequence evaluation with built-in scoring tools (supports both list-based trajectories and Session traces via extractors)
 - **InteractionsEvaluator**: Multi-agent interaction and handoff evaluation
-- **StructuredOutput**: Field-level scoring of structured output against ground truth, with order-independent list matching and per-field metrics (requires the `stickler` extra)
+- **StructuredOutputSimilarity**: Field-level scoring of structured output against ground truth, with order-independent list matching and per-field metrics (requires the `stickler` extra)
 - **Custom Evaluators**: Extensible base class for domain-specific logic
 
 ### Trace-Based Evaluators

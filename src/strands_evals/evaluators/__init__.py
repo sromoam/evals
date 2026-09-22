@@ -7,7 +7,7 @@ from .deterministic import (
     SkillInvoked,
     StartsWith,
     StateEquals,
-    StructuredOutput,
+    StructuredOutputSimilarity,
     ToolCalled,
 )
 from .evaluator import Evaluator
@@ -38,7 +38,7 @@ __all__ = [
     "SkillInvoked",
     "Evaluator",
     "OutputEvaluator",
-    "StructuredOutput",
+    "StructuredOutputSimilarity",
     "MultimodalOutputEvaluator",
     "MultimodalCorrectnessEvaluator",
     "MultimodalFaithfulnessEvaluator",

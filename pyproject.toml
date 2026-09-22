@@ -67,7 +67,7 @@ langchain = [
     "opentelemetry-instrumentation-langchain>=0.40.0,<0.63.0",
 ]
 adk = ["google-adk>=2.0.0,<3.0.0"]
-# StructuredOutput: field-level structured-output scoring via stickler.
+# StructuredOutputSimilarity: field-level structured-output scoring via stickler.
 stickler = ["stickler-eval>=1.0.0,<2.0.0"]
 claude = [
     "claude-agent-sdk>=0.2.0,<0.3.0",
