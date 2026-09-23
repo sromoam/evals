@@ -16,7 +16,7 @@ from importlib.util import find_spec
 from pathlib import Path
 
 import pytest
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, create_model
 
 from strands_evals import Case, Experiment
 from strands_evals.evaluators import Equals, Evaluator, StructuredOutputSimilarity
@@ -42,6 +42,13 @@ class Invoice(BaseModel):
 class Receipt(BaseModel):
     merchant: str
     tax: float
+
+
+class Nested:
+    """Holder for a nested model class, whose `__qualname__` is itself dotted."""
+
+    class Inner(BaseModel):
+        a: str
 
 
 def _invoice(iid="INV-1", vendor="Acme Corporation", total=100.0, sku="SKU-1", price=100.0):
@@ -459,6 +466,26 @@ class TestCoercion:
 
         assert evaluator.model_cls is Invoice
 
+    def test_a_nested_model_class_round_trips(self):
+        """`to_dict` emits `__qualname__`, so a nested class has a dotted qualname.
+
+        Splitting at the last dot read `myapp.models.Outer` as the module name and raised
+        ModuleNotFoundError instead of reloading.
+        """
+        evaluator = StructuredOutputSimilarity(Nested.Inner)
+        path = evaluator.to_dict()["model_cls"]
+
+        assert path.endswith(".Nested.Inner")
+        assert StructuredOutputSimilarity(path).model_cls is Nested.Inner
+
+    def test_an_unresolvable_path_raises_type_error(self):
+        with pytest.raises(TypeError, match="could not resolve"):
+            StructuredOutputSimilarity("no.such.module.Model")
+
+    def test_a_bare_name_raises_type_error(self):
+        with pytest.raises(TypeError, match="could not resolve"):
+            StructuredOutputSimilarity("Invoice")
+
 
 class TestExplain:
     """Config derived from the model class, so it stays on the evaluator."""
@@ -552,7 +579,7 @@ class TestPassRequiresFindingSomething:
         """A document whose ground truth is legitimately blank.
 
         stickler reports recall as 0.0 rather than None when the denominator is empty, so
-        a naive recall gate would fail this. The guard reads `tp + fn == 0` instead.
+        a naive recall gate would fail this. The guard reads the matrix instead.
         """
 
         class AllOptional(BaseModel):
@@ -563,6 +590,57 @@ class TestPassRequiresFindingSomething:
 
         assert outputs[0].score == 1.0
         assert outputs[0].test_pass is True
+
+    def test_every_populated_field_wrong_does_not_pass(self):
+        """stickler counts a wrong value as `fd`, not `fn`.
+
+        So `tp + fn` is not the number of fields there were to find, and reading it as
+        such made the "nothing to find" shortcut fire on a document whose ground truth was
+        fully populated and entirely mis-extracted -- the same false pass the recall gate
+        exists to close, reached through wrong values instead of missing ones.
+        """
+        gt = SparseInvoice(invoice_id="INV-8842", vendor_name="Acme Corporation")
+        wrong = SparseInvoice(invoice_id="ZZZ-0000", vendor_name="Zeta Industries GmbH")
+
+        outputs = StructuredOutputSimilarity(SparseInvoice).evaluate(_data(gt, wrong))
+
+        matrix = outputs[0].metadata["comparison"]["confusion_matrix"]["overall"]
+        assert (matrix["tp"], matrix["fn"]) == (0, 0), "the shortcut's old condition still holds"
+        assert matrix["fd"] == 2, "the populated fields are wrong, not missing"
+        assert outputs[0].score > 0.7, "the score really does clear the threshold"
+        assert outputs[0].test_pass is False, "nothing was extracted correctly, so it must not pass"
+
+    def test_fabricating_fields_for_a_blank_document_does_not_pass(self):
+        """Nothing to find, values invented anyway.
+
+        On a wide schema the invented fields are a minority, so the score clears the
+        threshold while precision is 0.0. Nothing corroborates the prediction.
+        """
+        fields = {f"f{index}": (str | None, None) for index in range(20)}
+        Wide = create_model("Wide", **fields)
+        fabricated = Wide(**{f"f{index}": "made up" for index in range(5)})
+
+        outputs = StructuredOutputSimilarity(Wide).evaluate(_data(Wide(), fabricated))
+
+        assert outputs[0].score > 0.7, "the score really does clear the threshold"
+        assert outputs[0].metadata["precision"] == 0.0
+        assert outputs[0].test_pass is False
+
+    def test_finding_everything_still_passes_when_extra_fields_are_invented(self):
+        """The documented limit of gating on recall alone.
+
+        Ground truth is often annotated sparsely, so failing an agent for extracting a
+        field the annotation merely omitted would be wrong. `precision` is on the row for
+        anyone wanting the stricter check.
+        """
+        gt = SparseInvoice(invoice_id="INV-1", vendor_name="Acme")
+        richer = SparseInvoice(invoice_id="INV-1", vendor_name="Acme", po_number="PO-9", notes="n")
+
+        outputs = StructuredOutputSimilarity(SparseInvoice).evaluate(_data(gt, richer))
+
+        assert outputs[0].metadata["recall"] == 1.0
+        assert outputs[0].test_pass is True
+        assert outputs[0].metadata["precision"] < 1.0, "precision shows what the gate ignores"
 
     def test_per_case_exposes_the_metrics_the_verdict_rests_on(self):
         gt = SparseInvoice(invoice_id="INV-1", vendor_name="Acme")

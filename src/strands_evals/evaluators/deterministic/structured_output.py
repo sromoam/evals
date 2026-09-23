@@ -56,6 +56,10 @@ def _stickler() -> tuple[Any, Any]:
 def _resolve_model_cls(model_cls: type[BaseModel] | str) -> type[BaseModel]:
     """Accept a model class or the dotted path `to_dict` emits for it.
 
+    The path is `module.QualName`, and a nested class makes the qualname itself dotted
+    (`myapp.models.Outer.Inner`), so where the module ends cannot be found by splitting at
+    the last dot. Each split is tried from the longest importable module prefix down.
+
     Args:
         model_cls: The Pydantic model class, or `module.QualName` naming it.
 
@@ -63,19 +67,45 @@ def _resolve_model_cls(model_cls: type[BaseModel] | str) -> type[BaseModel]:
         The model class.
 
     Raises:
-        TypeError: If the value is neither a Pydantic model class nor a dotted path to one.
+        TypeError: If the value is neither a Pydantic model class nor a dotted path
+            resolving to one.
     """
     if isinstance(model_cls, str):
-        module_name, _, qual_name = model_cls.rpartition(".")
-        if not module_name:
-            raise TypeError(f"model_cls string must be a dotted path like 'myapp.models.Invoice'; got {model_cls!r}")
-        resolved: Any = importlib.import_module(module_name)
-        for part in qual_name.split("."):
-            resolved = getattr(resolved, part)
-        model_cls = resolved
+        model_cls = _import_dotted_path(model_cls)
     if not (isinstance(model_cls, type) and issubclass(model_cls, BaseModel)):
         raise TypeError(f"model_cls must be a Pydantic model class; got {model_cls!r}")
     return model_cls
+
+
+def _import_dotted_path(path: str) -> Any:
+    """Resolve `module.QualName`, where the qualname may itself be dotted.
+
+    Args:
+        path: The dotted path to resolve.
+
+    Returns:
+        The named object.
+
+    Raises:
+        TypeError: If no split of the path names an importable module plus a reachable
+            attribute chain.
+    """
+    parts = path.split(".")
+    for split in range(len(parts) - 1, 0, -1):
+        try:
+            resolved: Any = importlib.import_module(".".join(parts[:split]))
+        except ImportError:
+            continue
+        for attribute in parts[split:]:
+            resolved = getattr(resolved, attribute, None)
+            if resolved is None:
+                break
+        else:
+            return resolved
+    raise TypeError(
+        f"model_cls string must be a dotted path to an importable model class, "
+        f"such as 'myapp.models.Invoice'; could not resolve {path!r}"
+    )
 
 
 def _passed(result: Any, match_threshold: float) -> bool:
@@ -95,19 +125,39 @@ def _passed(result: Any, match_threshold: float) -> bool:
     nor hurts it. This is what stickler recommends gating on for sparse schemas:
     https://awslabs.github.io/stickler/Getting-Started/thresholds-and-metrics/#sparse-objects
 
-    Two genuinely empty objects are a match, not a failure. That case is detected as
-    `tp + fn == 0` rather than by a null recall: stickler reports recall as 0.0, not None,
-    when the denominator is empty, so gating on recall alone would fail a document whose
-    ground truth was legitimately blank.
+    Two genuinely empty objects are a match, not a failure, and that case needs detecting
+    from the matrix rather than from a null recall: stickler reports recall as 0.0, not
+    None, when the denominator is empty, so gating on recall alone would fail a document
+    whose ground truth was legitimately blank.
+
+    Counting what there was to find needs all three truth-populated categories, not just
+    `tp + fn`. stickler classifies a *wrong* value as `fd` and a *missing* one as `fn`, so
+    a prediction that got every populated field wrong reads `tp + fn == 0` while the
+    ground truth was not blank at all:
+
+        ground truth invoice_id/vendor_name populated, both predicted wrong
+        -> {tp: 0, fn: 0, fd: 2, tn: 8}, score 0.80, recall 0.00
+
+    Taking that for "nothing to find" short-circuited the gate and passed it. The count is
+    `tp + fn + fd`.
+
+    When there genuinely was nothing to find, an invented value (`fa`) is still a failure:
+    nothing corroborates a prediction that fabricated fields for a blank document.
+
+    Known limit: with something to find, this gates on recall alone, so a prediction that
+    finds everything and *also* invents extra fields passes. That is deliberate. Ground
+    truth is often annotated sparsely, and a precision gate would fail an agent for
+    extracting a field the annotation merely omitted. Read `precision` from the row's
+    metadata for a stricter check.
     """
     if not bool(result.matched):
         return False
     # `raw["confusion_matrix"]` is stickler's own result shape rather than a documented
     # accessor; pinned safe by the `<2.0.0` bound on the extra.
     overall = (result.raw or {}).get("confusion_matrix", {}).get("overall", {})
-    findable = overall.get("tp", 0) + overall.get("fn", 0)
+    findable = overall.get("tp", 0) + overall.get("fn", 0) + overall.get("fd", 0)
     if findable == 0:
-        return True
+        return overall.get("fa", 0) == 0
     return result.recall is not None and result.recall >= match_threshold
 
 
