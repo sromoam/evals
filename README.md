@@ -550,7 +550,9 @@ In the second row `reason` reads `weakest fields: line_items=0.75`, and
 'total_amount': 1.0, 'line_items': 0.75}`. `metrics()` reports counts against the
 nested paths too -- `line_items.sku` and `line_items.quantity` -- so a suite tells you
 which field your agent gets wrong across the whole dataset rather than only that it
-failed.
+failed. One exception: a list item scoring below `match_threshold` counts as one wrong
+item under `line_items`, not under its fields. With few fields per item, a single wrong
+field can put the item below the threshold, so check the parent path's `fd` count too.
 
 The field detail rides on each report row rather than on the evaluator, so it survives
 `report.model_dump_json()` and `strands-evals run --output`, and `metrics()` works on a
