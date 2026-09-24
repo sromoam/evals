@@ -10,6 +10,7 @@ the imports at the top of the file where the house style wants them.
 """
 
 import asyncio
+import logging
 import tempfile
 import threading
 from importlib.util import find_spec
@@ -237,11 +238,50 @@ class TestDatasetRollup:
         assert total["fn"] == 1
         assert total["fd"] == 1
 
+    def test_an_unfiltered_mixed_report_raises_rather_than_merging(self):
+        """`metrics(report)` is the first thing anyone types, so it must not merge.
+
+        Merging unions the field paths, so `document_count` counts the whole suite and each
+        schema's fields read as absent across the other's documents.
+        """
+        cases = [_case("inv", _invoice()), _case("rec", Receipt(merchant="M", tax=1.0))]
+        actual = {"inv": _invoice(), "rec": Receipt(merchant="M", tax=1.0)}
+        report = Experiment(
+            cases=cases,
+            evaluators=[
+                StructuredOutputSimilarity(Invoice, name="inv"),
+                StructuredOutputSimilarity(Receipt, name="rec"),
+            ],
+        ).run_evaluations(lambda c: actual[c.metadata["name"]])
+
+        with pytest.raises(ValueError, match="pass evaluator="):
+            StructuredOutputSimilarity.metrics(report)
+
+        assert StructuredOutputSimilarity.metrics(report, evaluator="inv").document_count == 1
+
+    def test_calling_metrics_on_an_instance_raises_rather_than_misleading(self):
+        """`ev.metrics(report)` is the natural port of the old call.
+
+        It resolves to the static method and ignores the instance, so on a mixed report it
+        would silently aggregate every evaluator's rows.
+        """
+        cases = [_case("inv", _invoice()), _case("rec", Receipt(merchant="M", tax=1.0))]
+        actual = {"inv": _invoice(), "rec": Receipt(merchant="M", tax=1.0)}
+        evaluator = StructuredOutputSimilarity(Invoice, name="inv")
+        report = Experiment(
+            cases=cases,
+            evaluators=[evaluator, StructuredOutputSimilarity(Receipt, name="rec")],
+        ).run_evaluations(lambda c: actual[c.metadata["name"]])
+
+        with pytest.raises(ValueError, match="pass evaluator="):
+            evaluator.metrics(report)
+
     def test_two_schemas_get_separate_rollups(self):
         """A merged rollup would union field paths and misreport denominators.
 
-        With `model_cls` required, this is declared rather than inferred: two evaluators
-        with distinct names, filtered apart by `evaluator=`.
+        The README says one `Experiment` per schema, so this is not a recommended layout.
+        It is pinned because nothing stops a caller building it, and `evaluator=` has to
+        keep the rollups apart when they do.
         """
         cases = [_case("inv", _invoice()), _case("rec", Receipt(merchant="M", tax=1.0))]
         actual = {"inv": _invoice(), "rec": Receipt(merchant="M", tax=2.0)}
@@ -393,15 +433,81 @@ class TestCasesWithNothingToScore:
         assert [e["case"] for e in StructuredOutputSimilarity.per_case(report)] == ["good"]
         assert any(row.metadata == {"error": "validation_failed"} for rows in report.detailed_results for row in rows)
 
-    def test_a_foreign_shape_does_not_score(self):
-        """Strict mode must not coerce nonsense into a score."""
+    def test_a_foreign_ground_truth_is_not_applicable(self):
+        """A case belonging to another schema is not this evaluator's to judge.
+
+        Coercing it was actively harmful: `model_validate(other.model_dump())` drops every
+        unrecognized key, because Pydantic ignores extras by default, so an all-optional
+        target model came out blank on both sides and scored a perfect 1.0.
+        """
         report = _run(
             StructuredOutputSimilarity(Invoice),
             {"a": (Receipt(merchant="M", tax=1.0), Receipt(merchant="M", tax=1.0))},
         )
 
-        assert report.scores[0] == 0.0
-        assert report.detailed_results[0][0].metadata == {"error": "validation_failed"}
+        (row,) = report.detailed_results[0]
+        assert row.label == NOT_APPLICABLE
+        assert row.not_applicable is True
+        assert "not a Invoice" in (row.reason or "")
+
+    def test_an_all_optional_schema_does_not_score_a_foreign_case_as_perfect(self):
+        """The regression that motivated the check, on the shape that triggers it."""
+
+        class Sparse(BaseModel):
+            invoice_id: str | None = None
+            vendor_name: str | None = None
+
+        class Person(BaseModel):
+            name: str | None = None
+            email: str | None = None
+
+        person = Person(name="Ada", email="ada@example.com")
+        outputs = StructuredOutputSimilarity(Sparse).evaluate(_data(person, person))
+
+        assert outputs[0].label == NOT_APPLICABLE
+        assert outputs[0].score != 1.0, "a Person must never score as a perfect Sparse"
+
+    def test_a_foreign_actual_output_is_a_scored_failure(self):
+        """The agent emitting the wrong model is a failure, not a blank comparison."""
+        outputs = StructuredOutputSimilarity(Invoice).evaluate(_data(_invoice(), Receipt(merchant="M", tax=1.0)))
+
+        assert outputs[0].score == 0.0
+        assert outputs[0].test_pass is False
+        assert outputs[0].metadata == {"error": "validation_failed"}
+
+    def test_a_mixed_schema_suite_scores_each_schema_once(self):
+        """Every evaluator runs over every case, so cross pairs must not count.
+
+        Not a recommended layout -- the README says one `Experiment` per schema -- but a
+        caller can still build it, and before the not-applicable check it reported
+        `overall 1.0` with all four rows passing and `document_count` 2 for a one-invoice
+        suite. That is the false pass this pins shut.
+        """
+
+        class Sparse(BaseModel):
+            invoice_id: str | None = None
+            vendor_name: str | None = None
+
+        class Person(BaseModel):
+            name: str | None = None
+
+        cases = [
+            _case("inv", Sparse(invoice_id="INV-1", vendor_name="Acme")),
+            _case("person", Person(name="Ada")),
+        ]
+        actual = {"inv": Sparse(invoice_id="INV-1", vendor_name="Acme"), "person": Person(name="Ada")}
+        report = Experiment(
+            cases=cases,
+            evaluators=[
+                StructuredOutputSimilarity(Sparse, name="invoice"),
+                StructuredOutputSimilarity(Person, name="person"),
+            ],
+        ).run_evaluations(lambda c: actual[c.metadata["name"]])
+
+        assert StructuredOutputSimilarity.metrics(report, evaluator="invoice").document_count == 1
+        assert StructuredOutputSimilarity.metrics(report, evaluator="person").document_count == 1
+        assert report.overall_score == pytest.approx(1.0), "the cross pairs must not drag the mean"
+        assert sum(1 for rows in report.detailed_results for row in rows if row.not_applicable) == 2
 
 
 class TestConcurrency:
@@ -481,6 +587,34 @@ class TestCoercion:
     def test_an_unresolvable_path_raises_type_error(self):
         with pytest.raises(TypeError, match="could not resolve"):
             StructuredOutputSimilarity("no.such.module.Model")
+
+    def test_a_broken_module_reports_its_own_import_error(self, tmp_path, monkeypatch):
+        """A missing dependency inside the target module is not a bad path.
+
+        Reporting "could not resolve" for it hid the real ModuleNotFoundError.
+        """
+        (tmp_path / "broken_fixture_module.py").write_text(
+            "import totally_absent_dependency\n\nclass Model:\n    pass\n"
+        )
+        monkeypatch.syspath_prepend(str(tmp_path))
+
+        with pytest.raises(ModuleNotFoundError, match="totally_absent_dependency"):
+            StructuredOutputSimilarity("broken_fixture_module.Model")
+
+    def test_an_unimportable_model_warns_at_save_time(self, caplog):
+        """A model defined in a function cannot be reloaded from its dotted path."""
+
+        def make():
+            class Local(BaseModel):
+                a: str | None = None
+
+            return Local
+
+        with caplog.at_level(logging.WARNING):
+            path = StructuredOutputSimilarity(make()).to_dict()["model_cls"]
+
+        assert "<locals>" in path
+        assert "not importable by dotted path" in caplog.text
 
     def test_a_bare_name_raises_type_error(self):
         with pytest.raises(TypeError, match="could not resolve"):

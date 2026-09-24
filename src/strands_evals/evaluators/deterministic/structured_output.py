@@ -87,14 +87,23 @@ def _import_dotted_path(path: str) -> Any:
         The named object.
 
     Raises:
+        ImportError: If a candidate module exists but fails to import for its own reasons,
+            such as a missing dependency inside it. Reporting that as an unresolvable path
+            would hide the real cause.
         TypeError: If no split of the path names an importable module plus a reachable
             attribute chain.
     """
     parts = path.split(".")
     for split in range(len(parts) - 1, 0, -1):
+        module_name = ".".join(parts[:split])
         try:
-            resolved: Any = importlib.import_module(".".join(parts[:split]))
-        except ImportError:
+            resolved: Any = importlib.import_module(module_name)
+        except ImportError as exc:
+            missing = getattr(exc, "name", None)
+            if missing is not None and missing != module_name and not module_name.startswith(f"{missing}."):
+                # The module itself is present; something it imports is not. That is the
+                # caller's real problem, so it must not be reported as a bad path.
+                raise
             continue
         for attribute in parts[split:]:
             resolved = getattr(resolved, attribute, None)
@@ -201,11 +210,20 @@ class StructuredOutputSimilarity(Evaluator[InputT, OutputT]):
             `test_pass`. A case passes when the weighted score clears this AND recall
             does, because the score alone credits fields absent on both sides and so
             would pass a prediction that found nothing on a sparse schema. See `_passed`.
+
+            One value bounds both gates, deliberately: the score gate catches wrong
+            values, the recall gate catches missing ones, and the two loosen or tighten
+            together. Raising it therefore also tightens the tolerated omission rate --
+            at the 0.7 default an agent may leave up to 30% of the populated fields
+            empty and still clear the recall gate. For independent policies (say,
+            strict on values but tolerant of omissions), gate on `metadata["recall"]`
+            from each row yourself rather than on `test_pass`.
         weight_hints: When True, weight fields by name-based importance heuristics
             (ids and amounts count for more). Off by default so weights stay uniform
             and metrics are not skewed by guessed business criticality.
-        name: Optional evaluator name, forwarded to `Evaluator`. Give two instances
-            distinct names to keep a mixed-schema run's rollups separate.
+        name: Optional evaluator name, forwarded to `Evaluator`. If two instances do
+            share one `Experiment`, distinct names are what `metrics(evaluator=...)`
+            filters on.
 
     Raises:
         ImportError: If the `stickler` extra is not installed.
@@ -248,10 +266,23 @@ class StructuredOutputSimilarity(Evaluator[InputT, OutputT]):
 
         Returns:
             dict: The evaluator's information, with `model_cls` as a dotted path so the
-            result is JSON-serializable and `from_dict` can resolve it back.
+            result is JSON-serializable and `from_dict` can resolve it back. A model that
+            no other process can import by that path is written anyway, with a warning,
+            following how `OutputEvaluator.to_dict` handles tools it cannot serialize.
         """
         _dict = super().to_dict()
-        _dict["model_cls"] = f"{self._model_cls.__module__}.{self._model_cls.__qualname__}"
+        path = f"{self._model_cls.__module__}.{self._model_cls.__qualname__}"
+        if self._model_cls.__module__ == "__main__" or "<locals>" in self._model_cls.__qualname__:
+            # A model defined in the running script or inside a function. The path is
+            # written, because the rest of the experiment is still worth saving, but it
+            # resolves to nothing -- or worse, to a different same-named class -- when
+            # `from_file` runs elsewhere. Warning here beats failing at load time.
+            logger.warning(
+                "model_cls=<%s> | not importable by dotted path, so from_file() will not reload this "
+                "evaluator, move the model to an importable module to make the experiment portable",
+                path,
+            )
+        _dict["model_cls"] = path
         return _dict
 
     def evaluate(self, evaluation_case: EvaluationData[InputT, OutputT]) -> list[EvaluationOutput]:
@@ -262,9 +293,9 @@ class StructuredOutputSimilarity(Evaluator[InputT, OutputT]):
 
         Returns:
             A single-element list carrying the weighted score and, on `metadata`, the
-            per-field detail. A case with no `expected_output` returns a
-            `NOT_APPLICABLE` row; output that will not validate returns a score-0 row
-            naming why, rather than raising.
+            per-field detail. A case with no `expected_output`, or one whose ground truth
+            is a different model, returns a `NOT_APPLICABLE` row; output that will not
+            validate returns a score-0 row naming why, rather than raising.
         """
         name = self._model_cls.__name__
         if evaluation_case.expected_output is None:
@@ -273,6 +304,28 @@ class StructuredOutputSimilarity(Evaluator[InputT, OutputT]):
                     score=0.0,
                     test_pass=True,
                     reason="expected_output is None, so there was no ground truth to compare against",
+                    label=NOT_APPLICABLE,
+                )
+            ]
+
+        if isinstance(evaluation_case.expected_output, BaseModel) and not isinstance(
+            evaluation_case.expected_output, self._model_cls
+        ):
+            # This case belongs to a different schema, so this evaluator has nothing to
+            # judge. Scoring it would be worse than useless: coercing a foreign model
+            # drops every unrecognized key, because Pydantic ignores extras by default, so
+            # an all-optional target model yields a blank object on both sides and
+            # `_passed` reads "nothing to find, nothing invented" as a perfect match. That
+            # returned 1.0 and passed. The harness runs every evaluator over every case,
+            # so a suite with one evaluator per schema hits this on every cross pair.
+            other = type(evaluation_case.expected_output).__name__
+            return [
+                EvaluationOutput(
+                    score=0.0,
+                    test_pass=True,
+                    reason=(
+                        f"expected_output is a {other}, not a {name}, so there was nothing for this evaluator to judge"
+                    ),
                     label=NOT_APPLICABLE,
                 )
             ]
@@ -339,10 +392,8 @@ class StructuredOutputSimilarity(Evaluator[InputT, OutputT]):
         Args:
             report: The report to aggregate.
             evaluator: Evaluator name to filter on, for a run carrying more than one
-                evaluator. None aggregates every row that has a comparison. Pass this
-                when two instances scored different schemas: feeding two schemas into
-                one rollup unions their field paths, which makes a field present in half
-                the documents read as missed in the rest.
+                evaluator. None aggregates every row that has a comparison, and raises if
+                those rows came from more than one evaluator rather than merging them.
 
         Returns:
             stickler's `ProcessEvaluation`, whose `field_metrics` is keyed by dotted path
@@ -355,14 +406,26 @@ class StructuredOutputSimilarity(Evaluator[InputT, OutputT]):
             denominator than the document count. Cases whose output never validated
             carry no comparison, so they are absent here while still appearing in the
             report as score-0 rows.
+
+        Raises:
+            ValueError: If the selected rows came from more than one evaluator. Merging
+                two schemas unions their field paths, so `document_count` counts the whole
+                suite and each schema's fields read as absent across the other's
+                documents. Naming one evaluator is the only correct read.
         """
         _, aggregate_from_comparisons = _stickler()
-        comparisons = [
-            row.metadata["comparison"]
-            for _, row in _rows(report, evaluator)
+        scored = [
+            (case, row.metadata["comparison"])
+            for case, row in _rows(report, evaluator)
             if row.metadata and "comparison" in row.metadata
         ]
-        return aggregate_from_comparisons(comparisons)
+        names = sorted({str(case.get("evaluator")) for case, _ in scored})
+        if len(names) > 1:
+            raise ValueError(
+                f"report carries comparisons from {len(names)} evaluators ({', '.join(names)}); "
+                f"pass evaluator=<name> to aggregate one schema at a time"
+            )
+        return aggregate_from_comparisons([comparison for _, comparison in scored])
 
     @staticmethod
     def per_case(report: EvaluationReport, *, evaluator: str | None = None) -> list[Mapping[str, Any]]:
@@ -425,8 +488,10 @@ class StructuredOutputSimilarity(Evaluator[InputT, OutputT]):
         if isinstance(value, cls):
             return value
         if isinstance(value, BaseModel):
-            # A different model class carrying the same fields.
-            return cls.model_validate(value.model_dump())
+            # Deliberately not coerced via model_dump(). Pydantic ignores unrecognized
+            # keys, so a foreign model silently becomes a blank instance of `cls` rather
+            # than failing, which on an all-optional schema scores as a perfect match.
+            raise TypeError(f"{which} is a {type(value).__name__}, which is not a {cls.__name__}")
         if isinstance(value, dict):
             return cls.model_validate(value)
         if isinstance(value, str):

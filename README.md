@@ -562,17 +562,18 @@ StructuredOutputSimilarity.metrics(saved).field_metrics
 ```
 
 Comparison configuration is inferred from the model, so there is nothing to annotate.
-`model_cls` is required, and any foreign shape scores 0 with a reason rather than
-silently coercing. For a suite mixing output types, run one evaluator per schema with
-distinct `name=` values and pass `evaluator=` to `metrics()` to read them apart.
+`model_cls` is required: one evaluator scores one schema. Use a separate `Experiment` per
+output type if your agent emits more than one.
 
 **On sparse schemas, read `recall` or `f1`, not the score alone.** `score` credits a
 field absent on *both* sides with 1.0 -- a value the model correctly left blank is a
 value it got right -- so on a schema where most fields are usually empty those fields
 outvote the informative ones. A 10-field model whose ground truth populates 2 fields
 scores `0.80` against a prediction that returned *nothing*. `test_pass` therefore
-requires both the score and `recall` to clear `match_threshold`, and each row's
-`metadata` exposes `recall`, `precision` and `f1` so the verdict is auditable. To make
+requires both the score and `recall` to clear `match_threshold` -- one knob bounds both
+gates, so raising it also tightens the tolerated omission rate -- and each row's
+`metadata` exposes `recall`, `precision` and `f1`, so you can audit the verdict or gate
+the two independently yourself. To make
 `score` itself reflect the fields you care about, declare the model as a stickler
 `StructuredModel` and set `ComparableField(weight=...)` on them, or pass
 `weight_hints=True` to weight ids and amounts by name.
