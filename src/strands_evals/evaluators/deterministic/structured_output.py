@@ -21,6 +21,7 @@ import logging
 from typing import Any, Iterator, Mapping
 
 from pydantic import BaseModel, ValidationError
+from strands.agent.agent_result import AgentResult
 
 from ...types.evaluation import NOT_APPLICABLE, EvaluationData, EvaluationOutput, InputT, OutputT
 from ...types.evaluation_report import EvaluationReport
@@ -308,23 +309,20 @@ class StructuredOutputSimilarity(Evaluator[InputT, OutputT]):
                 )
             ]
 
-        if isinstance(evaluation_case.expected_output, BaseModel) and not isinstance(
-            evaluation_case.expected_output, self._model_cls
-        ):
-            # This case belongs to a different schema, so this evaluator has nothing to
-            # judge. Scoring it would be worse than useless: coercing a foreign model
-            # drops every unrecognized key, because Pydantic ignores extras by default, so
-            # an all-optional target model yields a blank object on both sides and
-            # `_passed` reads "nothing to find, nothing invented" as a perfect match. That
-            # returned 1.0 and passed. The harness runs every evaluator over every case,
-            # so a suite with one evaluator per schema hits this on every cross pair.
+        dropped = self._foreign_fields(evaluation_case.expected_output)
+        if dropped:
+            # Ground truth from a different schema: this evaluator has nothing to judge.
+            # Converting it would drop those fields, because Pydantic ignores unknown keys
+            # by default, and on an all-optional target model both sides would come out
+            # blank -- which `_passed` reads as a perfect match. That scored 1.0 and passed.
             other = type(evaluation_case.expected_output).__name__
             return [
                 EvaluationOutput(
                     score=0.0,
                     test_pass=True,
                     reason=(
-                        f"expected_output is a {other}, not a {name}, so there was nothing for this evaluator to judge"
+                        f"expected_output is {other}, whose fields {', '.join(dropped)} are not "
+                        f"on {name}, so there was nothing for this evaluator to judge"
                     ),
                     label=NOT_APPLICABLE,
                 )
@@ -482,21 +480,47 @@ class StructuredOutputSimilarity(Evaluator[InputT, OutputT]):
         """
         return self._spec.explain()
 
+    def _foreign_fields(self, value: Any) -> list[str]:
+        """Fields a model of another class carries that `model_cls` does not.
+
+        Empty for anything that is not a Pydantic model, and for a model of another class
+        whose fields all exist on `model_cls` -- the same class defined twice, as when a
+        notebook cell is re-run, or a second class with the same fields. Those convert
+        without loss. Class identity is the wrong test: re-running a cell creates a new
+        class object, so `isinstance` rejects instances of the old one.
+        """
+        if not isinstance(value, BaseModel) or isinstance(value, self._model_cls):
+            return []
+        return sorted(set(type(value).model_fields) - set(self._model_cls.model_fields))
+
     def _coerce(self, value: Any, which: str) -> BaseModel:
-        """Accept a model instance, a dict, or a JSON string."""
+        """Accept a model instance, an `AgentResult`, a dict, or a JSON string."""
         cls = self._model_cls
+        if isinstance(value, AgentResult):
+            # A task returning the agent's result directly is the natural way to write it.
+            if value.structured_output is None:
+                raise TypeError(
+                    f"{which} is an AgentResult with no structured_output; call the agent with "
+                    f"structured_output_model={cls.__name__}"
+                )
+            value = value.structured_output
         if isinstance(value, cls):
             return value
         if isinstance(value, BaseModel):
-            # Deliberately not coerced via model_dump(). Pydantic ignores unrecognized
-            # keys, so a foreign model silently becomes a blank instance of `cls` rather
-            # than failing, which on an all-optional schema scores as a perfect match.
-            raise TypeError(f"{which} is a {type(value).__name__}, which is not a {cls.__name__}")
+            dropped = self._foreign_fields(value)
+            if dropped:
+                raise TypeError(
+                    f"{which} is {type(value).__name__}, whose fields {', '.join(dropped)} are not on {cls.__name__}"
+                )
+            return cls.model_validate(value.model_dump())
         if isinstance(value, dict):
             return cls.model_validate(value)
         if isinstance(value, str):
             return cls.model_validate_json(value)
-        raise TypeError(f"{which} must be a {cls.__name__} instance, dict, or JSON string; got {type(value).__name__}")
+        raise TypeError(
+            f"{which} must be a {cls.__name__} instance, an AgentResult, a dict, or a JSON string; "
+            f"got {type(value).__name__}"
+        )
 
     @staticmethod
     def _weakest(field_scores: Mapping[str, float], limit: int = 4) -> str:

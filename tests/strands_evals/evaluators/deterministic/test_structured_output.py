@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 from pydantic import BaseModel, ValidationError, create_model
+from strands.agent.agent_result import AgentResult
 
 from strands_evals import Case, Experiment
 from strands_evals.evaluators import Equals, Evaluator, StructuredOutputSimilarity
@@ -448,7 +449,7 @@ class TestCasesWithNothingToScore:
         (row,) = report.detailed_results[0]
         assert row.label == NOT_APPLICABLE
         assert row.not_applicable is True
-        assert "not a Invoice" in (row.reason or "")
+        assert "are not on Invoice" in (row.reason or "")
 
     def test_an_all_optional_schema_does_not_score_a_foreign_case_as_perfect(self):
         """The regression that motivated the check, on the shape that triggers it."""
@@ -466,6 +467,59 @@ class TestCasesWithNothingToScore:
 
         assert outputs[0].label == NOT_APPLICABLE
         assert outputs[0].score != 1.0, "a Person must never score as a perfect Sparse"
+
+    def test_a_redefined_class_with_the_same_fields_still_scores(self):
+        """Re-running a notebook cell creates a new class object with the same fields.
+
+        Instances of the old class then fail `isinstance` against the new one, so a check
+        on class identity made every case not-applicable and the suite scored 0.0.
+        Nothing is dropped converting between them, so they are scored.
+        """
+        old = create_model("Invoice", invoice_id=(str, ...), vendor_name=(str | None, None))
+        new = create_model("Invoice", invoice_id=(str, ...), vendor_name=(str | None, None))
+        assert old is not new
+
+        outputs = StructuredOutputSimilarity(new).evaluate(
+            _data(old(invoice_id="I1", vendor_name="Acme"), old(invoice_id="I1", vendor_name="Acme"))
+        )
+
+        assert outputs[0].label == "Invoice"
+        assert outputs[0].score == 1.0
+
+    def test_a_foreign_ground_truth_reason_names_the_dropped_fields(self):
+        outputs = StructuredOutputSimilarity(Invoice).evaluate(
+            _data(Receipt(merchant="M", tax=1.0), Receipt(merchant="M", tax=1.0))
+        )
+
+        assert "merchant, tax" in (outputs[0].reason or "")
+
+    def test_an_agent_result_is_unwrapped(self):
+        """Returning the agent's result directly is the natural way to write the task."""
+        result = AgentResult(
+            stop_reason="end_turn",
+            message={"role": "assistant", "content": []},
+            metrics=None,
+            state={},
+            structured_output=_invoice(vendor="Acme Corp"),
+        )
+
+        from_result = StructuredOutputSimilarity(Invoice).evaluate(_data(_invoice(), result))[0]
+        from_model = StructuredOutputSimilarity(Invoice).evaluate(_data(_invoice(), _invoice(vendor="Acme Corp")))[0]
+
+        assert from_result.score == pytest.approx(from_model.score)
+
+    def test_an_agent_result_without_structured_output_says_how_to_fix_it(self):
+        result = AgentResult(
+            stop_reason="end_turn",
+            message={"role": "assistant", "content": [{"text": "prose"}]},
+            metrics=None,
+            state={},
+        )
+
+        outputs = StructuredOutputSimilarity(Invoice).evaluate(_data(_invoice(), result))
+
+        assert outputs[0].score == 0.0
+        assert "structured_output_model=Invoice" in (outputs[0].reason or "")
 
     def test_a_foreign_actual_output_is_a_scored_failure(self):
         """The agent emitting the wrong model is a failure, not a blank comparison."""
@@ -565,7 +619,7 @@ class TestCoercion:
         outputs = evaluator.evaluate(_data(_invoice(), 42))
 
         assert outputs[0].score == 0.0
-        assert "instance, dict, or JSON string" in (outputs[0].reason or "")
+        assert "an AgentResult, a dict, or a JSON string" in (outputs[0].reason or "")
 
     def test_a_model_class_accepts_its_own_dotted_path(self):
         evaluator = StructuredOutputSimilarity(f"{Invoice.__module__}.Invoice")
