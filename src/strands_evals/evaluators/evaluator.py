@@ -356,11 +356,13 @@ class Evaluator(Generic[InputT, OutputT]):
                     if isinstance(v, Model):
                         # Serialize Model instance to model_id
                         _dict["model_id"] = self._get_model_id(v)
-                    elif v is None and "model" in defaults and defaults["model"] is None:
-                        # model=None is default, serialize as model_id with default value
-                        _dict["model_id"] = self._get_model_id(None)
-                    elif v is not None:
-                        # String model ID, include as-is
+                    elif v is None:
+                        # model=None means "resolve the default at runtime". Omit it (like any
+                        # other default-valued field) so reload restores None rather than pinning
+                        # the judge to whatever DEFAULT_BEDROCK_MODEL_ID happens to be.
+                        pass
+                    else:
+                        # Explicit string model ID, include as-is
                         _dict[k] = v
                 elif k not in defaults or v != defaults[k]:
                     _dict[k] = v

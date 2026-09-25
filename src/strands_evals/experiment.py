@@ -22,7 +22,15 @@ from .evaluation_data_store import EvaluationDataStore
 from .evaluators.coherence_evaluator import CoherenceEvaluator
 from .evaluators.conciseness_evaluator import ConcisenessEvaluator
 from .evaluators.correctness_evaluator import CorrectnessEvaluator
-from .evaluators.deterministic import Contains, Equals, SkillInvoked, StartsWith, StateEquals, ToolCalled
+from .evaluators.deterministic import (
+    Contains,
+    Equals,
+    SkillInvoked,
+    StartsWith,
+    StateEquals,
+    StructuredOutputSimilarity,
+    ToolCalled,
+)
 from .evaluators.evaluator import Evaluator
 from .evaluators.faithfulness_evaluator import FaithfulnessEvaluator
 from .evaluators.goal_success_rate_evaluator import GoalSuccessRateEvaluator
@@ -820,6 +828,7 @@ class Experiment(Generic[InputT, OutputT]):
             "Contains": Contains,
             "StartsWith": StartsWith,
             "StateEquals": StateEquals,
+            "StructuredOutputSimilarity": StructuredOutputSimilarity,
             "ToolCalled": ToolCalled,
             "SkillInvoked": SkillInvoked,
         }

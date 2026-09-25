@@ -3,6 +3,7 @@ from unittest.mock import MagicMock
 import pytest
 from strands.models.model import Model
 
+from strands_evals import Case, Experiment
 from strands_evals.evaluators import Evaluator, OutputEvaluator
 from strands_evals.evaluators.evaluator import DEFAULT_BEDROCK_MODEL_ID
 from strands_evals.types import EvaluationData, EvaluationOutput
@@ -155,8 +156,12 @@ def test_to_dict_with_string_model():
     assert evaluator_dict["model"] == "bedrock-model-id"
 
 
-def test_to_dict_with_none_model():
-    """Test that to_dict handles None model correctly (uses default)"""
+def test_to_dict_omits_default_none_model():
+    """model=None means 'resolve the default at runtime', so it must not be serialized.
+
+    Writing it out as model_id=DEFAULT_BEDROCK_MODEL_ID pins every reloaded experiment's
+    judge to that specific model and loses the runtime-default semantics.
+    """
 
     evaluator = OutputEvaluator(rubric="test rubric", model=None)
     evaluator_dict = evaluator.to_dict()
@@ -164,7 +169,17 @@ def test_to_dict_with_none_model():
     assert evaluator_dict["evaluator_type"] == "OutputEvaluator"
     assert evaluator_dict["rubric"] == "test rubric"
     assert "model" not in evaluator_dict
-    assert evaluator_dict["model_id"] == DEFAULT_BEDROCK_MODEL_ID
+    assert "model_id" not in evaluator_dict
+
+
+def test_none_model_survives_round_trip_as_none():
+    """A default-model evaluator must reload with model=None, not an explicit pin."""
+    original = OutputEvaluator(rubric="test rubric", model=None)
+    experiment = Experiment(cases=[Case(name="c", input="i", expected_output="o")], evaluators=[original])
+
+    reloaded = Experiment.from_dict(experiment.to_dict())
+
+    assert reloaded.evaluators[0].model is None
 
 
 def test_has_text_content_with_single_text_at_start():
