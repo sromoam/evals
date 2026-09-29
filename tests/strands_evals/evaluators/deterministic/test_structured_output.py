@@ -199,6 +199,30 @@ class TestBindingTheRollupReport:
         assert type(report) is EvaluationReport
         assert not hasattr(report, "metrics")
 
+    def test_a_report_written_unbound_rolls_up_after_reload(self):
+        """The `strands-evals run --output` path: plain report out, subclass reads it back.
+
+        Report JSON does not depend on `report_cls`, so the rollups a bound run computes in
+        memory are the same ones a reload computes from the file.
+        """
+        pairs = {"a": (_invoice(), _invoice(vendor="Acme Corp")), "b": (_invoice(), _invoice(total=55.0))}
+        bound = _run(StructuredOutputSimilarity(Invoice), pairs)
+
+        cases = [_case(name, expected) for name, (expected, _) in pairs.items()]
+        actual = {name: act for name, (_, act) in pairs.items()}
+        unbound = Experiment(cases=cases, evaluators=[StructuredOutputSimilarity(Invoice)]).run_evaluations(
+            lambda c: actual[c.metadata["name"]]
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "report.json")
+            unbound.to_file(path)
+            reloaded = StructuredOutputReport.from_file(path)
+
+        assert type(reloaded) is StructuredOutputReport
+        assert reloaded.per_case() == bound.per_case()
+        assert reloaded.metrics().field_metrics == bound.metrics().field_metrics
+
 
 class TestCaseScore:
     def test_case_score_equals_stickler_overall_score(self):
