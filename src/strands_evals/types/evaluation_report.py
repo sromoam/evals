@@ -1,7 +1,9 @@
 import json
+from collections.abc import Sequence
 from pathlib import Path
 
 from pydantic import BaseModel
+from typing_extensions import Self, TypeVar
 
 from ..display.display_console import CollapsibleTableReportDisplay
 from ..types.evaluation import EvaluationOutput
@@ -62,7 +64,7 @@ class EvaluationReport(BaseModel):
         return sum(applicable_scores) / len(applicable_scores) if applicable_scores else 0.0
 
     @classmethod
-    def flatten(cls, reports: list["EvaluationReport"]) -> "EvaluationReport":
+    def flatten(cls, reports: Sequence["EvaluationReport"]) -> Self:
         """Concatenate multiple evaluation reports into one.
 
         The base `Experiment` already returns a flattened report; this helper exists for callers
@@ -349,3 +351,8 @@ class EvaluationReport(BaseModel):
             data = json.load(f)
 
         return cls.from_dict(data)
+
+
+ReportT = TypeVar("ReportT", bound=EvaluationReport, default=EvaluationReport)
+"""The report type an `Experiment` produces. Defaults to `EvaluationReport`, so existing
+`Experiment[InputT, OutputT]` annotations keep working unchanged."""
