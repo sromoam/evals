@@ -285,9 +285,13 @@ class EvaluationReport(BaseModel):
         return self.model_dump()
 
     @classmethod
-    def from_dict(cls, data: dict):
+    def from_dict(cls, data: dict) -> Self:
         """
         Create an EvaluationReport instance from a dictionary.
+
+        `Self` rather than `EvaluationReport`, for the same reason `flatten` returns it: a
+        subclass bound as an `Experiment`'s `report_cls` reads a report file back as itself,
+        and the caller should get that type rather than `Any`.
 
         Args:
             data: A dictionary containing the report data.
@@ -327,7 +331,7 @@ class EvaluationReport(BaseModel):
             json.dump(self.to_dict(), f, indent=2)
 
     @classmethod
-    def from_file(cls, path: str):
+    def from_file(cls, path: str) -> Self:
         """
         Create an EvaluationReport instance from a JSON file.
 
@@ -335,7 +339,8 @@ class EvaluationReport(BaseModel):
             path: Path to the JSON file.
 
         Return:
-            An EvaluationReport object.
+            An instance of the class it is called on, so a `report_cls` subclass reads its
+            own reports back as itself.
 
         Raises:
             ValueError: If the file does not have a .json extension.
