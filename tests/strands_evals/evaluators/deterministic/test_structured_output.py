@@ -21,7 +21,7 @@ from pydantic import BaseModel, ValidationError, create_model
 from strands.agent.agent_result import AgentResult
 
 from strands_evals import Case, Experiment
-from strands_evals.evaluators import Equals, Evaluator, StructuredOutputSimilarity
+from strands_evals.evaluators import Equals, Evaluator, StructuredOutputReport, StructuredOutputSimilarity
 from strands_evals.local_file_task_result_store import LocalFileTaskResultStore
 from strands_evals.types.evaluation import NOT_APPLICABLE, EvaluationData
 from strands_evals.types.evaluation_report import EvaluationReport
@@ -71,7 +71,7 @@ def _run(evaluator, pairs, **kwargs):
     cases = [_case(name, exp) for name, (exp, _) in pairs.items()]
     actual = {name: act for name, (_, act) in pairs.items()}
     return asyncio.run(
-        Experiment(cases=cases, evaluators=[evaluator]).run_evaluations_async(
+        Experiment(cases=cases, evaluators=[evaluator], report_cls=StructuredOutputReport).run_evaluations_async(
             lambda c: actual[c.metadata["name"]], **kwargs
         )
     )
@@ -83,7 +83,7 @@ def _data(expected, actual):
 
 def _reload(report):
     """Round-trip a report through JSON, as `strands-evals run --output` does."""
-    return EvaluationReport.model_validate_json(report.model_dump_json())
+    return StructuredOutputReport.model_validate_json(report.model_dump_json())
 
 
 class TestPerCaseOutput:
@@ -144,7 +144,7 @@ class TestDetailRidesOnTheReport:
     def test_per_case_reads_the_report(self):
         report = _run(StructuredOutputSimilarity(Invoice), {"doc-a": (_invoice(), _invoice(vendor="Acme Corp"))})
 
-        (entry,) = StructuredOutputSimilarity.per_case(report)
+        (entry,) = report.per_case()
         assert entry["case"] == "doc-a"
         assert entry["model"] == "Invoice"
         assert set(entry["field_scores"]) == set(Invoice.model_fields)
@@ -156,18 +156,15 @@ class TestDetailRidesOnTheReport:
             max_workers=5,
         )
 
-        assert [e["case"] for e in StructuredOutputSimilarity.per_case(report)] == [f"doc-{i}" for i in range(5)]
+        assert [e["case"] for e in report.per_case()] == [f"doc-{i}" for i in range(5)]
 
     def test_detail_survives_serialization(self):
         """The reason the detail moved. Held on the evaluator, none of this reloads."""
         report = _run(StructuredOutputSimilarity(Invoice), {"a": (_invoice(), _invoice(vendor="Acme Corp"))})
         reloaded = _reload(report)
 
-        assert StructuredOutputSimilarity.per_case(reloaded) == StructuredOutputSimilarity.per_case(report)
-        assert (
-            StructuredOutputSimilarity.metrics(reloaded).field_metrics
-            == StructuredOutputSimilarity.metrics(report).field_metrics
-        )
+        assert reloaded.per_case() == report.per_case()
+        assert reloaded.metrics().field_metrics == report.metrics().field_metrics
 
     def test_reusing_one_instance_does_not_blend_runs(self):
         """Two runs of one instance used to share an accumulator and double the count."""
@@ -175,9 +172,32 @@ class TestDetailRidesOnTheReport:
         first = _run(evaluator, {"a": (_invoice(), _invoice())})
         second = _run(evaluator, {"b": (_invoice(), _invoice())})
 
-        assert StructuredOutputSimilarity.metrics(first).document_count == 1
-        assert StructuredOutputSimilarity.metrics(second).document_count == 1
-        assert [e["case"] for e in StructuredOutputSimilarity.per_case(second)] == ["b"]
+        assert first.metrics().document_count == 1
+        assert second.metrics().document_count == 1
+        assert [e["case"] for e in second.per_case()] == ["b"]
+
+
+class TestBindingTheRollupReport:
+    """The rollups are methods on `StructuredOutputReport`, bound via `report_cls`."""
+
+    def test_run_evaluations_returns_the_rollup_report(self):
+        report = _run(StructuredOutputSimilarity(Invoice), {"a": (_invoice(), _invoice())})
+
+        assert type(report) is StructuredOutputReport
+
+    def test_without_report_cls_the_report_has_no_rollups(self):
+        """Not a defect to fix, the reason `from_file` is the documented route for a CLI run.
+
+        `report_cls` is not carried by `to_dict`/`from_dict`, and the CLI builds its own
+        `Experiment` without it, so an unbound run yields the base class.
+        """
+        cases = [_case("a", _invoice())]
+        report = Experiment(cases=cases, evaluators=[StructuredOutputSimilarity(Invoice)]).run_evaluations(
+            lambda c: _invoice()
+        )
+
+        assert type(report) is EvaluationReport
+        assert not hasattr(report, "metrics")
 
 
 class TestCaseScore:
@@ -217,7 +237,7 @@ class TestDatasetRollup:
     def test_metrics_includes_nested_paths(self):
         report = _run(StructuredOutputSimilarity(Invoice), {"a": (_invoice(), _invoice())})
 
-        paths = StructuredOutputSimilarity.metrics(report).field_metrics
+        paths = report.metrics().field_metrics
         assert "line_items" in paths
         assert "line_items.sku" in paths
 
@@ -225,7 +245,7 @@ class TestDatasetRollup:
         n = 5
         report = _run(StructuredOutputSimilarity(Invoice), {f"c{i}": (_invoice(), _invoice()) for i in range(n)})
 
-        assert StructuredOutputSimilarity.metrics(report).document_count == n
+        assert report.metrics().document_count == n
 
     def test_five_categories_are_populated(self):
         """FN is a missed field, FA an invented one, FD a wrong one."""
@@ -235,15 +255,17 @@ class TestDatasetRollup:
 
         report = _run(StructuredOutputSimilarity(Invoice), {"missing": (gt, missing), "wrong": (gt, wrong)})
 
-        total = StructuredOutputSimilarity.metrics(report).field_metrics["total_amount"]
+        total = report.metrics().field_metrics["total_amount"]
         assert total["fn"] == 1
         assert total["fd"] == 1
 
     def test_an_unfiltered_mixed_report_raises_rather_than_merging(self):
-        """`metrics(report)` is the first thing anyone types, so it must not merge.
+        """`report.metrics()` is the first thing anyone types, so it must not merge.
 
         Merging unions the field paths, so `document_count` counts the whole suite and each
-        schema's fields read as absent across the other's documents.
+        schema's fields read as absent across the other's documents. Two evaluators also
+        means this is the `flatten` path, so it doubles as proof that `flatten` returns
+        `report_cls` rather than the base class.
         """
         cases = [_case("inv", _invoice()), _case("rec", Receipt(merchant="M", tax=1.0))]
         actual = {"inv": _invoice(), "rec": Receipt(merchant="M", tax=1.0)}
@@ -253,29 +275,15 @@ class TestDatasetRollup:
                 StructuredOutputSimilarity(Invoice, name="inv"),
                 StructuredOutputSimilarity(Receipt, name="rec"),
             ],
+            report_cls=StructuredOutputReport,
         ).run_evaluations(lambda c: actual[c.metadata["name"]])
 
-        with pytest.raises(ValueError, match="pass evaluator="):
-            StructuredOutputSimilarity.metrics(report)
-
-        assert StructuredOutputSimilarity.metrics(report, evaluator="inv").document_count == 1
-
-    def test_calling_metrics_on_an_instance_raises_rather_than_misleading(self):
-        """`ev.metrics(report)` is the natural port of the old call.
-
-        It resolves to the static method and ignores the instance, so on a mixed report it
-        would silently aggregate every evaluator's rows.
-        """
-        cases = [_case("inv", _invoice()), _case("rec", Receipt(merchant="M", tax=1.0))]
-        actual = {"inv": _invoice(), "rec": Receipt(merchant="M", tax=1.0)}
-        evaluator = StructuredOutputSimilarity(Invoice, name="inv")
-        report = Experiment(
-            cases=cases,
-            evaluators=[evaluator, StructuredOutputSimilarity(Receipt, name="rec")],
-        ).run_evaluations(lambda c: actual[c.metadata["name"]])
+        assert type(report) is StructuredOutputReport
 
         with pytest.raises(ValueError, match="pass evaluator="):
-            evaluator.metrics(report)
+            report.metrics()
+
+        assert report.metrics(evaluator="inv").document_count == 1
 
     def test_two_schemas_get_separate_rollups(self):
         """A merged rollup would union field paths and misreport denominators.
@@ -292,10 +300,11 @@ class TestDatasetRollup:
                 StructuredOutputSimilarity(Invoice, name="invoice"),
                 StructuredOutputSimilarity(Receipt, name="receipt"),
             ],
+            report_cls=StructuredOutputReport,
         ).run_evaluations(lambda c: actual[c.metadata["name"]])
 
-        invoice = StructuredOutputSimilarity.metrics(report, evaluator="invoice")
-        receipt = StructuredOutputSimilarity.metrics(report, evaluator="receipt")
+        invoice = report.metrics(evaluator="invoice")
+        receipt = report.metrics(evaluator="receipt")
 
         assert set(receipt.field_metrics) == {"merchant", "tax"}
         assert "merchant" not in invoice.field_metrics
@@ -430,8 +439,8 @@ class TestCasesWithNothingToScore:
         )
 
         assert len(report.scores) == 2
-        assert StructuredOutputSimilarity.metrics(report).document_count == 1
-        assert [e["case"] for e in StructuredOutputSimilarity.per_case(report)] == ["good"]
+        assert report.metrics().document_count == 1
+        assert [e["case"] for e in report.per_case()] == ["good"]
         assert any(row.metadata == {"error": "validation_failed"} for rows in report.detailed_results for row in rows)
 
     def test_a_foreign_ground_truth_is_not_applicable(self):
@@ -556,10 +565,11 @@ class TestCasesWithNothingToScore:
                 StructuredOutputSimilarity(Sparse, name="invoice"),
                 StructuredOutputSimilarity(Person, name="person"),
             ],
+            report_cls=StructuredOutputReport,
         ).run_evaluations(lambda c: actual[c.metadata["name"]])
 
-        assert StructuredOutputSimilarity.metrics(report, evaluator="invoice").document_count == 1
-        assert StructuredOutputSimilarity.metrics(report, evaluator="person").document_count == 1
+        assert report.metrics(evaluator="invoice").document_count == 1
+        assert report.metrics(evaluator="person").document_count == 1
         assert report.overall_score == pytest.approx(1.0), "the cross pairs must not drag the mean"
         assert sum(1 for rows in report.detailed_results for row in rows if row.not_applicable) == 2
 
@@ -596,7 +606,7 @@ class TestConcurrency:
         )
 
         assert len(report.scores) == n
-        assert StructuredOutputSimilarity.metrics(report).document_count == n
+        assert report.metrics().document_count == n
 
 
 class TestCoercion:
@@ -834,7 +844,7 @@ class TestPassRequiresFindingSomething:
         gt = SparseInvoice(invoice_id="INV-1", vendor_name="Acme")
         report = _run(StructuredOutputSimilarity(SparseInvoice), {"a": (gt, gt.model_copy())})
 
-        (entry,) = StructuredOutputSimilarity.per_case(report)
+        (entry,) = report.per_case()
         for key in ("test_pass", "matched", "precision", "recall", "f1"):
             assert key in entry, f"per_case() should expose {key}"
 

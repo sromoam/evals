@@ -110,14 +110,102 @@ def _passed(result: Any, match_threshold: float) -> bool:
     return result.recall is not None and result.recall >= match_threshold
 
 
-def _rows(report: EvaluationReport, evaluator: str | None) -> Iterator[tuple[Mapping[str, Any], EvaluationOutput]]:
-    """Yield `(case, row)` pairs from a report, for one evaluator when `evaluator` is set."""
-    for index, rows in enumerate(report.detailed_results):
-        case: Mapping[str, Any] = report.cases[index] if index < len(report.cases) else {}
-        if evaluator is not None and case.get("evaluator") != evaluator:
-            continue
-        for row in rows:
-            yield case, row
+class StructuredOutputReport(EvaluationReport):
+    """An `EvaluationReport` that can roll up `StructuredOutputSimilarity`'s field detail.
+
+    The rollups are methods rather than functions because the detail they read is on the
+    report: each row's `metadata`. Bind the report to the experiment and `run_evaluations`
+    returns it, with no cast:
+
+        report = Experiment(
+            cases=cases,
+            evaluators=[StructuredOutputSimilarity(Invoice)],
+            report_cls=StructuredOutputReport,
+        ).run_evaluations(task)
+
+        report.metrics()    # per-field confusion matrix
+        report.per_case()   # per-document field scores
+
+    Reading detail off the report rather than off the evaluator is what makes both survive
+    `flatten` and `model_dump_json`. So a report written by `strands-evals run --output`
+    reloads as this class and rolls up the same, which is the route to use for one: the CLI
+    builds its own `Experiment` and cannot be given a `report_cls`, so it always writes the
+    base class.
+
+        StructuredOutputReport.from_file("report.json").metrics()
+    """
+
+    def metrics(self, *, evaluator: str | None = None) -> Any:
+        """Per-field metrics across every case in the report.
+
+        A nested path only counts documents whose parent item scored at or above
+        `match_threshold`; below it, the item counts as one wrong unit under the parent
+        path. Cases whose output did not validate carry no comparison and are skipped.
+
+        Args:
+            evaluator: Evaluator name to read, for a report carrying more than one.
+
+        Returns:
+            stickler's `ProcessEvaluation`. Its `field_metrics` is keyed by dotted path
+            (`line_items.sku`), with tp/tn/fn/fa/fd counts, precision, recall, F1 and
+            accuracy.
+
+        Raises:
+            ValueError: If the rows come from more than one evaluator and `evaluator` is
+                not set. Merging two schemas would union their field paths.
+        """
+        _, aggregate_from_comparisons = _stickler()
+        scored = [
+            (case, row.metadata["comparison"])
+            for case, row in self._rows(evaluator)
+            if row.metadata and "comparison" in row.metadata
+        ]
+        names = sorted({str(case.get("evaluator")) for case, _ in scored})
+        if len(names) > 1:
+            raise ValueError(
+                f"report carries comparisons from {len(names)} evaluators ({', '.join(names)}); "
+                f"pass evaluator=<name> to aggregate one schema at a time"
+            )
+        return aggregate_from_comparisons([comparison for _, comparison in scored])
+
+    def per_case(self, *, evaluator: str | None = None) -> list[Mapping[str, Any]]:
+        """Per-document field scores in case order, as a flat table.
+
+        Nested list children have no per-leaf score, so they appear in `metrics` only.
+        Cases whose output did not validate are omitted.
+
+        Args:
+            evaluator: Evaluator name to read, for a report carrying more than one.
+
+        Returns:
+            One entry per scored case: `case`, `model`, `overall_score`, `test_pass`,
+            `matched`, `precision`, `recall`, `f1` and `field_scores`. `matched` is
+            stickler's score-only verdict; `test_pass` also requires recall.
+        """
+        return [
+            {
+                "case": case.get("name"),
+                "model": row.label,
+                "overall_score": row.score,
+                "test_pass": row.test_pass,
+                "matched": row.metadata["matched"],
+                "precision": row.metadata["precision"],
+                "recall": row.metadata["recall"],
+                "f1": row.metadata["f1"],
+                "field_scores": dict(row.metadata["field_scores"]),
+            }
+            for case, row in self._rows(evaluator)
+            if row.metadata and "field_scores" in row.metadata
+        ]
+
+    def _rows(self, evaluator: str | None) -> Iterator[tuple[Mapping[str, Any], EvaluationOutput]]:
+        """Yield `(case, row)` pairs, for one evaluator when `evaluator` is set."""
+        for index, rows in enumerate(self.detailed_results):
+            case: Mapping[str, Any] = self.cases[index] if index < len(self.cases) else {}
+            if evaluator is not None and case.get("evaluator") != evaluator:
+                continue
+            for row in rows:
+                yield case, row
 
 
 class StructuredOutputSimilarity(Evaluator[InputT, OutputT]):
@@ -127,7 +215,8 @@ class StructuredOutputSimilarity(Evaluator[InputT, OutputT]):
     as `structured_output_model`; `explain` shows every inferred choice. Each case yields
     one row: the weighted score on `score`, and on `metadata` the per-field scores,
     `precision`, `recall`, `f1` and the raw comparison. Because the detail lives in the
-    report, `metrics` and `per_case` read a report, including one reloaded from JSON.
+    report, the rollups are methods on `StructuredOutputReport` — pass that as the
+    experiment's `report_cls` to get them.
 
     Args:
         model_cls: The Pydantic model the agent emits, or the dotted path `to_dict` writes.
@@ -137,8 +226,8 @@ class StructuredOutputSimilarity(Evaluator[InputT, OutputT]):
             the populated fields empty. For separate policies, gate on `metadata["recall"]`.
         weight_hints: Weight fields by name-based heuristics (ids and amounts count more).
             Off by default, so weights stay uniform.
-        name: Evaluator name, forwarded to `Evaluator`; what `metrics(evaluator=...)`
-            filters on.
+        name: Evaluator name, forwarded to `Evaluator`; what
+            `StructuredOutputReport.metrics(evaluator=...)` filters on.
 
     Raises:
         ImportError: If the `stickler` extra is not installed.
@@ -271,73 +360,6 @@ class StructuredOutputSimilarity(Evaluator[InputT, OutputT]):
                     "comparison": {k: v for k, v in result.raw.items() if k != "prediction_raw"},
                 },
             )
-        ]
-
-    @staticmethod
-    def metrics(report: EvaluationReport, *, evaluator: str | None = None) -> Any:
-        """Per-field metrics across every case in a report.
-
-        A nested path only counts documents whose parent item scored at or above
-        `match_threshold`; below it, the item counts as one wrong unit under the parent
-        path. Cases whose output did not validate carry no comparison and are skipped.
-
-        Args:
-            report: The report to aggregate, in memory or reloaded from JSON.
-            evaluator: Evaluator name to read, for a report carrying more than one.
-
-        Returns:
-            stickler's `ProcessEvaluation`. Its `field_metrics` is keyed by dotted path
-            (`line_items.sku`), with tp/tn/fn/fa/fd counts, precision, recall, F1 and
-            accuracy.
-
-        Raises:
-            ValueError: If the rows come from more than one evaluator and `evaluator` is
-                not set. Merging two schemas would union their field paths.
-        """
-        _, aggregate_from_comparisons = _stickler()
-        scored = [
-            (case, row.metadata["comparison"])
-            for case, row in _rows(report, evaluator)
-            if row.metadata and "comparison" in row.metadata
-        ]
-        names = sorted({str(case.get("evaluator")) for case, _ in scored})
-        if len(names) > 1:
-            raise ValueError(
-                f"report carries comparisons from {len(names)} evaluators ({', '.join(names)}); "
-                f"pass evaluator=<name> to aggregate one schema at a time"
-            )
-        return aggregate_from_comparisons([comparison for _, comparison in scored])
-
-    @staticmethod
-    def per_case(report: EvaluationReport, *, evaluator: str | None = None) -> list[Mapping[str, Any]]:
-        """Per-document field scores in case order, as a flat table.
-
-        Nested list children have no per-leaf score, so they appear in `metrics` only.
-        Cases whose output did not validate are omitted.
-
-        Args:
-            report: The report to read.
-            evaluator: Evaluator name to read, for a report carrying more than one.
-
-        Returns:
-            One entry per scored case: `case`, `model`, `overall_score`, `test_pass`,
-            `matched`, `precision`, `recall`, `f1` and `field_scores`. `matched` is
-            stickler's score-only verdict; `test_pass` also requires recall.
-        """
-        return [
-            {
-                "case": case.get("name"),
-                "model": row.label,
-                "overall_score": row.score,
-                "test_pass": row.test_pass,
-                "matched": row.metadata["matched"],
-                "precision": row.metadata["precision"],
-                "recall": row.metadata["recall"],
-                "f1": row.metadata["f1"],
-                "field_scores": dict(row.metadata["field_scores"]),
-            }
-            for case, row in _rows(report, evaluator)
-            if row.metadata and "field_scores" in row.metadata
         ]
 
     def explain(self) -> dict[str, dict[str, Any]]:
