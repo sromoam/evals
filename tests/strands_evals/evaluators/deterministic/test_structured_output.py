@@ -334,6 +334,38 @@ class TestDatasetRollup:
         assert "merchant" not in invoice.field_metrics
 
 
+class TestAskingForSomethingThatIsNotThere:
+    """A rollup that finds nothing says so, instead of returning an empty that reads clean."""
+
+    def test_an_unknown_evaluator_name_raises_rather_than_reading_empty(self):
+        """An empty rollup is indistinguishable from a suite where nothing could be scored.
+
+        `evaluator=` is a free-form string, so a typo is the likely way to arrive here, and
+        a silent empty sends the caller looking for the fault in their data. The message
+        lists the names the report does carry, as the mixed-report error does.
+        """
+        report = _run(StructuredOutputSimilarity(Invoice, name="inv"), {"a": (_invoice(), _invoice())})
+
+        with pytest.raises(ValueError, match="no rows from evaluator 'Inv'; this report carries: inv"):
+            report.metrics(evaluator="Inv")
+
+        with pytest.raises(ValueError, match="no rows from evaluator 'Inv'"):
+            report.per_case(evaluator="Inv")
+
+    def test_a_row_carrying_partial_detail_is_skipped_rather_than_raising(self):
+        """`per_case` reads five metadata keys, so guarding on one alone raises `KeyError`.
+
+        A row is written with all five or with none, so this is reachable only through a
+        hand-built or hand-edited report -- which is exactly what `from_file` invites. It
+        should degrade the way `metrics` already does, not fail mid-table.
+        """
+        report = _run(StructuredOutputSimilarity(Invoice), {"a": (_invoice(), _invoice())})
+        report.detailed_results[0][0].metadata = {"field_scores": {"invoice_id": 1.0}}
+
+        assert report.per_case() == []
+        assert report.metrics().document_count == 0
+
+
 class TestModelClassIsRequired:
     """Inferring the class per case silently scored 0 on any case loaded from JSON.
 

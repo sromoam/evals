@@ -10,7 +10,7 @@ Requires the `stickler` extra: `pip install "strands-agents-evals[stickler]"`.
 
 import importlib
 import logging
-from typing import Any, Iterator, Mapping
+from typing import Any, Mapping
 
 from pydantic import BaseModel, ValidationError
 from strands.agent.agent_result import AgentResult
@@ -20,6 +20,10 @@ from ...types.evaluation_report import EvaluationReport
 from ..evaluator import Evaluator
 
 logger = logging.getLogger(__name__)
+
+# Every key `per_case` reads off a row, so a row carrying only some of them is skipped
+# rather than raising `KeyError` on the first one missing.
+_FIELD_DETAIL_KEYS = frozenset({"field_scores", "matched", "precision", "recall", "f1"})
 
 
 def _stickler() -> tuple[Any, Any]:
@@ -152,7 +156,8 @@ class StructuredOutputReport(EvaluationReport):
 
         Raises:
             ValueError: If the rows come from more than one evaluator and `evaluator` is
-                not set. Merging two schemas would union their field paths.
+                not set. Merging two schemas would union their field paths. Also if
+                `evaluator` names no evaluator in the report.
         """
         _, aggregate_from_comparisons = _stickler()
         scored = [
@@ -182,6 +187,9 @@ class StructuredOutputReport(EvaluationReport):
             One entry per scored case: `case`, `model`, `overall_score`, `test_pass`,
             `matched`, `precision`, `recall`, `f1` and `field_scores`. `matched` is
             stickler's score-only verdict; `test_pass` also requires recall.
+
+        Raises:
+            ValueError: If `evaluator` names no evaluator in the report.
         """
         return [
             {
@@ -196,17 +204,32 @@ class StructuredOutputReport(EvaluationReport):
                 "field_scores": dict(row.metadata["field_scores"]),
             }
             for case, row in self._rows(evaluator)
-            if row.metadata and "field_scores" in row.metadata
+            if row.metadata and _FIELD_DETAIL_KEYS <= row.metadata.keys()
         ]
 
-    def _rows(self, evaluator: str | None) -> Iterator[tuple[Mapping[str, Any], EvaluationOutput]]:
-        """Yield `(case, row)` pairs, for one evaluator when `evaluator` is set."""
+    def _rows(self, evaluator: str | None) -> list[tuple[Mapping[str, Any], EvaluationOutput]]:
+        """Return `(case, row)` pairs, for one evaluator when `evaluator` is set.
+
+        A list rather than a generator so an unknown `evaluator` raises where it is passed
+        rather than where the caller happens to iterate.
+
+        Raises:
+            ValueError: If `evaluator` names no evaluator in the report.
+        """
+        if evaluator is not None:
+            present = {str(case["evaluator"]) for case in self.cases if case.get("evaluator") is not None}
+            if evaluator not in present:
+                raise ValueError(
+                    f"no rows from evaluator {evaluator!r}; this report carries: "
+                    f"{', '.join(sorted(present)) or '(none)'}"
+                )
+        pairs: list[tuple[Mapping[str, Any], EvaluationOutput]] = []
         for index, rows in enumerate(self.detailed_results):
             case: Mapping[str, Any] = self.cases[index] if index < len(self.cases) else {}
             if evaluator is not None and case.get("evaluator") != evaluator:
                 continue
-            for row in rows:
-                yield case, row
+            pairs.extend((case, row) for row in rows)
+        return pairs
 
 
 class StructuredOutputSimilarity(Evaluator[InputT, OutputT]):
