@@ -127,10 +127,9 @@ class StructuredOutputReport(EvaluationReport):
         report.per_case()   # per-document field scores
 
     Reading detail off the report rather than off the evaluator is what makes both survive
-    `flatten` and `model_dump_json`. So a report written by `strands-evals run --output`
-    reloads as this class and rolls up the same, which is the route to use for one: the CLI
-    builds its own `Experiment` and cannot be given a `report_cls`, so it always writes the
-    base class.
+    `flatten` and `model_dump_json`. Nothing binds this class automatically: the CLI builds
+    its own `Experiment`, and `Experiment.to_dict` keeps only cases and evaluators, so both
+    write the base class. Reload their JSON through this class to roll it up.
 
         StructuredOutputReport.from_file("report.json").metrics()
     """
@@ -140,15 +139,16 @@ class StructuredOutputReport(EvaluationReport):
 
         A nested path only counts documents whose parent item scored at or above
         `match_threshold`; below it, the item counts as one wrong unit under the parent
-        path. Cases whose output did not validate carry no comparison and are skipped.
+        path. Rows carrying no comparison are skipped: output that failed to validate,
+        cases with no ground truth, and rows from other evaluators.
 
         Args:
             evaluator: Evaluator name to read, for a report carrying more than one.
 
         Returns:
             stickler's `ProcessEvaluation`. Its `field_metrics` is keyed by dotted path
-            (`line_items.sku`), with tp/tn/fn/fa/fd counts, precision, recall, F1 and
-            accuracy.
+            (`line_items.sku`), with `tp`/`tn`/`fn`/`fa`/`fp`/`fd` counts and `cm_precision`,
+            `cm_recall`, `cm_f1` and `cm_accuracy`.
 
         Raises:
             ValueError: If the rows come from more than one evaluator and `evaluator` is
@@ -172,7 +172,8 @@ class StructuredOutputReport(EvaluationReport):
         """Per-document field scores in case order, as a flat table.
 
         Nested list children have no per-leaf score, so they appear in `metrics` only.
-        Cases whose output did not validate are omitted.
+        Rows carrying no field scores are omitted: output that failed to validate, cases
+        with no ground truth, and rows from other evaluators.
 
         Args:
             evaluator: Evaluator name to read, for a report carrying more than one.

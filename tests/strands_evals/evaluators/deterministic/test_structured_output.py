@@ -188,8 +188,8 @@ class TestBindingTheRollupReport:
     def test_without_report_cls_the_report_has_no_rollups(self):
         """Not a defect to fix, the reason `from_file` is the documented route for a CLI run.
 
-        `report_cls` is not carried by `to_dict`/`from_dict`, and the CLI builds its own
-        `Experiment` without it, so an unbound run yields the base class.
+        `report_cls` is not carried by `Experiment.to_dict`/`from_dict`, and the CLI builds its
+        own `Experiment` without it, so an unbound run yields the base class.
         """
         cases = [_case("a", _invoice())]
         report = Experiment(cases=cases, evaluators=[StructuredOutputSimilarity(Invoice)]).run_evaluations(

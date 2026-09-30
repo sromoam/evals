@@ -289,9 +289,8 @@ class EvaluationReport(BaseModel):
         """
         Create an EvaluationReport instance from a dictionary.
 
-        `Self` rather than `EvaluationReport`, for the same reason `flatten` returns it: a
-        subclass bound as an `Experiment`'s `report_cls` reads a report file back as itself,
-        and the caller should get that type rather than `Any`.
+        Returns the class it is called on, so a subclass bound as an `Experiment`'s
+        `report_cls` validates back as itself rather than as `EvaluationReport`.
 
         Args:
             data: A dictionary containing the report data.

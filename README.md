@@ -514,6 +514,7 @@ Deterministic and offline: no LLM judge, no credentials, no per-call cost.
 
 ```python
 from pydantic import BaseModel
+from strands_evals import Experiment
 from strands_evals.evaluators import StructuredOutputReport, StructuredOutputSimilarity
 
 class LineItem(BaseModel):
@@ -538,7 +539,7 @@ report.overall_score                              # weighted mean across the dat
 report.detailed_results[0][0].metadata            # this case's field scores, plus
                                                   # precision / recall / f1
 report.per_case()                                 # the same, as a flat table
-report.metrics()                                  # per-field confusion matrix, keyed by
+report.metrics().field_metrics                    # per-field confusion matrix, keyed by
                                                   # dotted path, with cm_precision /
                                                   # cm_recall / cm_f1 per field
 evaluator.explain()                               # the comparator chosen per field, and why
