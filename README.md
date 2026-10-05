@@ -514,7 +514,8 @@ Deterministic and offline: no LLM judge, no credentials, no per-call cost.
 
 ```python
 from pydantic import BaseModel
-from strands_evals.evaluators import StructuredOutputSimilarity
+from strands_evals import Experiment
+from strands_evals.evaluators import StructuredOutputReport, StructuredOutputSimilarity
 
 class LineItem(BaseModel):
     sku: str | None = None
@@ -528,13 +529,17 @@ class Invoice(BaseModel):
 
 # The same model the agent already emits as structured_output_model.
 evaluator = StructuredOutputSimilarity(Invoice)
-report = Experiment(cases=cases, evaluators=[evaluator]).run_evaluations(task)
+report = Experiment(
+    cases=cases,
+    evaluators=[evaluator],
+    report_cls=StructuredOutputReport,            # binds the rollups below; without it
+).run_evaluations(task)                           # you get a plain EvaluationReport
 
 report.overall_score                              # weighted mean across the dataset
 report.detailed_results[0][0].metadata            # this case's field scores, plus
                                                   # precision / recall / f1
-StructuredOutputSimilarity.per_case(report)       # the same, as a flat table
-StructuredOutputSimilarity.metrics(report)        # per-field confusion matrix, keyed by
+report.per_case()                                 # the same, as a flat table
+report.metrics().field_metrics                    # per-field confusion matrix, keyed by
                                                   # dotted path, with cm_precision /
                                                   # cm_recall / cm_f1 per field
 evaluator.explain()                               # the comparator chosen per field, and why
@@ -550,7 +555,7 @@ identical, so the extraction is correct:
 
 In the second row `reason` reads `weakest fields: line_items=0.75`, and
 `metadata["field_scores"]` gives `{'invoice_id': 1.0, 'vendor_name': 1.0,
-'total_amount': 1.0, 'line_items': 0.75}`. `metrics()` reports counts against the
+'total_amount': 1.0, 'line_items': 0.75}`. `report.metrics()` reports counts against the
 nested paths too -- `line_items.sku` and `line_items.quantity` -- so a suite tells you
 which field your agent gets wrong across the whole dataset rather than only that it
 failed. One exception: a list item scoring below `match_threshold` counts as one wrong
@@ -558,12 +563,14 @@ item under `line_items`, not under its fields. With few fields per item, a singl
 field can put the item below the threshold, so check the parent path's `fd` count too.
 
 The field detail rides on each report row rather than on the evaluator, so it survives
-`report.model_dump_json()` and `strands-evals run --output`, and `metrics()` works on a
-report reloaded from disk:
+`report.model_dump_json()` and `strands-evals run --output`. Report JSON does not depend on
+`report_cls`, so a report written without one still rolls up -- read it back as
+`StructuredOutputReport`. This is the route for anything `strands-evals run` produced: the
+CLI builds its own `Experiment` and cannot be given a `report_cls`, so it always writes the
+base class.
 
 ```python
-saved = EvaluationReport.model_validate_json(Path("report.json").read_text())
-StructuredOutputSimilarity.metrics(saved).field_metrics
+StructuredOutputReport.from_file("report.json").metrics().field_metrics
 ```
 
 Comparison configuration is inferred from the model, so there is nothing to annotate.

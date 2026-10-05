@@ -10,7 +10,7 @@ from strands import tool as strands_tool
 from strands.models.model import Model
 from strands.types.exceptions import EventLoopException, ModelThrottledException
 
-from strands_evals import Case, DiagnosisConfig, Experiment
+from strands_evals import Case, DiagnosisConfig, EvaluationReport, Experiment
 from strands_evals import evaluators as builtin_evaluators
 from strands_evals.evaluators import (
     Contains,
@@ -2236,3 +2236,110 @@ def test_evaluator_name_default_omitted_from_to_dict():
 
     payload = experiment.to_dict()
     assert "name" not in payload["evaluators"][0]
+
+
+class RichReport(EvaluationReport):
+    """Report subclass exercising the `report_cls` extension point."""
+
+    def pass_rate(self) -> float:
+        return sum(self.test_passes) / len(self.test_passes) if self.test_passes else 0.0
+
+
+class RichReportExperiment(Experiment[str, str, RichReport]):
+    report_cls = RichReport
+
+
+def test_experiment_report_cls_defaults_to_base(mock_evaluator, simple_task):
+    """An unparameterized Experiment still returns the plain EvaluationReport."""
+    cases = [Case(name="match", input="hello", expected_output="hello")]
+
+    report = Experiment(cases=cases, evaluators=[mock_evaluator]).run_evaluations(simple_task)
+
+    assert type(report) is EvaluationReport
+
+
+def test_experiment_report_cls_returns_subclass(mock_evaluator, simple_task):
+    """A subclass binding ReportT gets its report type back from run_evaluations."""
+    cases = [
+        Case(name="match", input="hello", expected_output="hello"),
+        Case(name="no_match", input="foo", expected_output="bar"),
+    ]
+
+    report = RichReportExperiment(cases=cases, evaluators=[mock_evaluator]).run_evaluations(simple_task)
+
+    assert type(report) is RichReport
+    assert report.pass_rate() == 0.5
+    assert report.overall_score == 0.5
+
+
+def test_experiment_report_cls_flattens_as_subclass(mock_evaluator, simple_task):
+    """The multi-evaluator path flattens with report_cls, not the base class."""
+    cases = [Case(name="match", input="hello", expected_output="hello")]
+    experiment = RichReportExperiment(cases=cases, evaluators=[mock_evaluator, MockEvaluator2()])
+
+    report = experiment.run_evaluations(simple_task)
+
+    assert type(report) is RichReport
+    assert len(report.scores) == 2
+    assert report.pass_rate() == 1.0
+
+
+def test_experiment_report_cls_report_round_trips_as_base(mock_evaluator, simple_task, tmp_path):
+    """A subclass-written report file reloads cleanly as the base EvaluationReport."""
+    cases = [Case(name="match", input="hello", expected_output="hello")]
+    report = RichReportExperiment(cases=cases, evaluators=[mock_evaluator]).run_evaluations(simple_task)
+
+    path = str(tmp_path / "report.json")
+    report.to_file(path)
+    reloaded = EvaluationReport.from_file(path)
+
+    assert type(reloaded) is EvaluationReport
+    assert reloaded.model_dump() == EvaluationReport(**report.model_dump()).model_dump()
+
+    rich_reloaded = RichReport.from_file(path)
+    assert rich_reloaded.pass_rate() == report.pass_rate()
+
+
+def test_experiment_report_cls_kwarg(mock_evaluator, simple_task):
+    """Passing report_cls at construction returns the subclass without subclassing Experiment."""
+    cases = [Case(name="match", input="hello", expected_output="hello")]
+
+    report = Experiment(cases=cases, evaluators=[mock_evaluator], report_cls=RichReport).run_evaluations(simple_task)
+
+    assert type(report) is RichReport
+    assert report.pass_rate() == 1.0
+
+
+def test_experiment_report_cls_kwarg_overrides_class_attribute(mock_evaluator, simple_task):
+    """The constructor kwarg wins over a subclass's report_cls attribute."""
+    cases = [Case(name="match", input="hello", expected_output="hello")]
+
+    report = RichReportExperiment(
+        cases=cases, evaluators=[mock_evaluator], report_cls=EvaluationReport
+    ).run_evaluations(simple_task)
+
+    assert type(report) is EvaluationReport
+
+
+class MinScoreReport(EvaluationReport):
+    """Report overriding the scoring hook, to prove report_cls drives overall_score."""
+
+    @classmethod
+    def calculate_overall_score(cls, scores, detailed_results):
+        return min(scores) if scores else 0.0
+
+
+def test_experiment_report_cls_scoring_override_applies_to_single_evaluator(mock_evaluator, simple_task):
+    """The single-evaluator path scores with report_cls, same as the flatten path."""
+    cases = [
+        Case(name="match", input="hello", expected_output="hello"),
+        Case(name="no_match", input="foo", expected_output="bar"),
+    ]
+
+    experiment = Experiment(cases=cases, evaluators=[mock_evaluator], report_cls=MinScoreReport)
+    report = experiment.run_evaluations(simple_task)
+
+    assert report.overall_score == 0.0  # min(1.0, 0.0), not the default average of 0.5
+
+    multi = Experiment(cases=cases, evaluators=[mock_evaluator, MockEvaluator2()], report_cls=MinScoreReport)
+    assert multi.run_evaluations(simple_task).overall_score == 0.0
