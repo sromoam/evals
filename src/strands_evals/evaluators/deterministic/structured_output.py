@@ -21,9 +21,8 @@ from ..evaluator import Evaluator
 
 logger = logging.getLogger(__name__)
 
-# Every key `per_case` reads off a row, so a row carrying only some of them is skipped
-# rather than raising `KeyError` on the first one missing.
-_FIELD_DETAIL_KEYS = frozenset({"field_scores", "matched", "precision", "recall", "f1"})
+# The field detail `evaluate` writes on a scored row. A row carries all of it or none.
+_DETAIL_KEYS = frozenset({"field_scores", "matched", "precision", "recall", "f1", "comparison"})
 
 
 def _stickler() -> tuple[Any, Any]:
@@ -139,12 +138,12 @@ class StructuredOutputReport(EvaluationReport):
     """
 
     def metrics(self, *, evaluator: str | None = None) -> Any:
-        """Per-field metrics across every case in the report.
+        """Per-field metrics across every scored case in the report.
 
         A nested path only counts documents whose parent item scored at or above
         `match_threshold`; below it, the item counts as one wrong unit under the parent
-        path. Rows carrying no comparison are skipped: output that failed to validate,
-        cases with no ground truth, and rows from other evaluators.
+        path. Rows without field detail are skipped: output that failed to validate, cases
+        with no ground truth, and rows from other evaluators.
 
         Args:
             evaluator: Evaluator name to read, for a report carrying more than one.
@@ -155,30 +154,31 @@ class StructuredOutputReport(EvaluationReport):
             `cm_recall`, `cm_f1` and `cm_accuracy`.
 
         Raises:
-            ValueError: If the rows come from more than one evaluator and `evaluator` is
-                not set. Merging two schemas would union their field paths. Also if
-                `evaluator` names no evaluator in the report.
+            ValueError: If the scored rows compare more than one model, or come from more
+                than one evaluator with `evaluator` unset, since merging would union their
+                field paths. Also if there is nothing to roll up; see `per_case`.
         """
         _, aggregate_from_comparisons = _stickler()
-        scored = [
-            (case, row.metadata["comparison"])
-            for case, row in self._rows(evaluator)
-            if row.metadata and "comparison" in row.metadata
-        ]
+        scored = self._scored_rows(evaluator)
         names = sorted({str(case.get("evaluator")) for case, _ in scored})
         if len(names) > 1:
             raise ValueError(
                 f"report carries comparisons from {len(names)} evaluators ({', '.join(names)}); "
                 f"pass evaluator=<name> to aggregate one schema at a time"
             )
-        return aggregate_from_comparisons([comparison for _, comparison in scored])
+        models = sorted({str(row.label) for _, row in scored})
+        if len(models) > 1:
+            raise ValueError(
+                f"report compares {len(models)} models ({', '.join(models)}) under one evaluator name; "
+                f"call metrics() on each report before flattening them, or give the evaluators distinct names"
+            )
+        return aggregate_from_comparisons([row.metadata["comparison"] for _, row in scored if row.metadata])
 
     def per_case(self, *, evaluator: str | None = None) -> list[Mapping[str, Any]]:
         """Per-document field scores in case order, as a flat table.
 
         Nested list children have no per-leaf score, so they appear in `metrics` only.
-        Rows carrying no field scores are omitted: output that failed to validate, cases
-        with no ground truth, and rows from other evaluators.
+        Rows without field detail are omitted, as in `metrics`.
 
         Args:
             evaluator: Evaluator name to read, for a report carrying more than one.
@@ -189,7 +189,8 @@ class StructuredOutputReport(EvaluationReport):
             stickler's score-only verdict; `test_pass` also requires recall.
 
         Raises:
-            ValueError: If `evaluator` names no evaluator in the report.
+            ValueError: If `evaluator` names no evaluator in the report, if a row carries
+                only part of the field detail, or if no row was scored at all.
         """
         return [
             {
@@ -197,24 +198,25 @@ class StructuredOutputReport(EvaluationReport):
                 "model": row.label,
                 "overall_score": row.score,
                 "test_pass": row.test_pass,
-                "matched": row.metadata["matched"],
-                "precision": row.metadata["precision"],
-                "recall": row.metadata["recall"],
-                "f1": row.metadata["f1"],
-                "field_scores": dict(row.metadata["field_scores"]),
+                "matched": detail["matched"],
+                "precision": detail["precision"],
+                "recall": detail["recall"],
+                "f1": detail["f1"],
+                "field_scores": dict(detail["field_scores"]),
             }
-            for case, row in self._rows(evaluator)
-            if row.metadata and _FIELD_DETAIL_KEYS <= row.metadata.keys()
+            for case, row in self._scored_rows(evaluator)
+            if (detail := row.metadata) is not None
         ]
 
-    def _rows(self, evaluator: str | None) -> list[tuple[Mapping[str, Any], EvaluationOutput]]:
-        """Return `(case, row)` pairs, for one evaluator when `evaluator` is set.
+    def _scored_rows(self, evaluator: str | None) -> list[tuple[Mapping[str, Any], EvaluationOutput]]:
+        """The `(case, row)` pairs carrying field detail, for one evaluator when `evaluator` is set.
 
-        A list rather than a generator so an unknown `evaluator` raises where it is passed
-        rather than where the caller happens to iterate.
+        The single rule both rollups select by, so they never disagree about which rows count.
+        It returns rows or raises: an empty result would read the same as a clean one.
 
         Raises:
-            ValueError: If `evaluator` names no evaluator in the report.
+            ValueError: If `evaluator` names no evaluator in the report, if a row carries only
+                part of the field detail, or if nothing was scored.
         """
         if evaluator is not None:
             present = {str(case["evaluator"]) for case in self.cases if case.get("evaluator") is not None}
@@ -223,13 +225,26 @@ class StructuredOutputReport(EvaluationReport):
                     f"no rows from evaluator {evaluator!r}; this report carries: "
                     f"{', '.join(sorted(present)) or '(none)'}"
                 )
-        pairs: list[tuple[Mapping[str, Any], EvaluationOutput]] = []
+        scored: list[tuple[Mapping[str, Any], EvaluationOutput]] = []
         for index, rows in enumerate(self.detailed_results):
             case: Mapping[str, Any] = self.cases[index] if index < len(self.cases) else {}
-            if evaluator is not None and case.get("evaluator") != evaluator:
+            if evaluator is not None and str(case.get("evaluator")) != evaluator:
                 continue
-            pairs.extend((case, row) for row in rows)
-        return pairs
+            for row in rows:
+                carried = _DETAIL_KEYS & (row.metadata or {}).keys()
+                if not carried:
+                    continue
+                if carried != _DETAIL_KEYS:
+                    missing = ", ".join(sorted(_DETAIL_KEYS - carried))
+                    raise ValueError(f"row for case {case.get('name')!r} is missing field detail: {missing}")
+                scored.append((case, row))
+        if not scored:
+            source = f"evaluator {evaluator!r}" if evaluator is not None else "this report"
+            raise ValueError(
+                f"{source} has no scored structured-output rows: every row is from another evaluator, "
+                f"had no ground truth, or failed to validate"
+            )
+        return scored
 
 
 class StructuredOutputSimilarity(Evaluator[InputT, OutputT]):

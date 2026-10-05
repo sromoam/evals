@@ -197,7 +197,6 @@ class TestBindingTheRollupReport:
         )
 
         assert type(report) is EvaluationReport
-        assert not hasattr(report, "metrics")
 
     def test_a_report_written_unbound_rolls_up_after_reload(self):
         """The `strands-evals run --output` path: plain report out, subclass reads it back.
@@ -352,18 +351,82 @@ class TestAskingForSomethingThatIsNotThere:
         with pytest.raises(ValueError, match="no rows from evaluator 'Inv'"):
             report.per_case(evaluator="Inv")
 
-    def test_a_row_carrying_partial_detail_is_skipped_rather_than_raising(self):
-        """`per_case` reads five metadata keys, so guarding on one alone raises `KeyError`.
+    def test_a_row_carrying_partial_detail_raises_from_both_rollups(self):
+        """`evaluate` writes all of the field detail or none, so a partial row is a corrupted report.
 
-        A row is written with all five or with none, so this is reachable only through a
-        hand-built or hand-edited report -- which is exactly what `from_file` invites. It
-        should degrade the way `metrics` already does, not fail mid-table.
+        Skipping it let the two rollups disagree: dropping one key emptied `per_case` while
+        `metrics` still counted the row. Both now select through one rule, and raise.
         """
-        report = _run(StructuredOutputSimilarity(Invoice), {"a": (_invoice(), _invoice())})
-        report.detailed_results[0][0].metadata = {"field_scores": {"invoice_id": 1.0}}
+        report = _run(StructuredOutputSimilarity(Invoice), {"doc-a": (_invoice(), _invoice())})
+        report.detailed_results[0][0].metadata.pop("matched")
 
-        assert report.per_case() == []
-        assert report.metrics().document_count == 0
+        with pytest.raises(ValueError, match="row for case 'doc-a' is missing field detail: matched"):
+            report.per_case()
+        with pytest.raises(ValueError, match="row for case 'doc-a' is missing field detail: matched"):
+            report.metrics()
+
+    def test_naming_an_evaluator_without_field_detail_raises(self):
+        """`Equals` is in the report but has nothing to roll up; an empty result would read clean."""
+        cases = [_case("a", _invoice())]
+        report = Experiment(
+            cases=cases,
+            evaluators=[StructuredOutputSimilarity(Invoice, name="inv"), Equals()],
+            report_cls=StructuredOutputReport,
+        ).run_evaluations(lambda c: _invoice())
+
+        with pytest.raises(ValueError, match="evaluator 'Equals' has no scored structured-output rows"):
+            report.metrics(evaluator="Equals")
+        with pytest.raises(ValueError, match="evaluator 'Equals' has no scored structured-output rows"):
+            report.per_case(evaluator="Equals")
+
+        assert report.metrics(evaluator="inv").document_count == 1
+
+    def test_a_report_where_nothing_was_scored_raises(self):
+        """Every prediction failing to validate is a result to report, not an empty rollup."""
+        report = _run(StructuredOutputSimilarity(Invoice), {"a": (_invoice(), "prose"), "b": (_invoice(), "prose")})
+
+        with pytest.raises(ValueError, match="this report has no scored structured-output rows"):
+            report.metrics()
+        with pytest.raises(ValueError, match="this report has no scored structured-output rows"):
+            report.per_case()
+
+    def test_a_non_string_evaluator_tag_still_filters(self):
+        """A hand-edited report can carry a non-string tag; filtering compares strings on both sides."""
+        report = _run(StructuredOutputSimilarity(Invoice, name="1"), {"a": (_invoice(), _invoice())})
+        report.cases[0]["evaluator"] = 1
+
+        assert report.metrics(evaluator="1").document_count == 1
+        assert len(report.per_case(evaluator="1")) == 1
+
+
+class TestFlattenedReports:
+    """`flatten` is the documented way to merge reports, so the schema guard has to hold across it."""
+
+    def test_flattening_two_schemas_under_one_name_raises(self):
+        """Two separately run reports share the default evaluator name, so a name check alone passed.
+
+        `metrics()` then returned one rollup over both schemas' field paths. The guard also
+        compares the model each row was scored as.
+        """
+        invoice = _run(StructuredOutputSimilarity(Invoice), {"inv": (_invoice(), _invoice())})
+        receipt = _run(
+            StructuredOutputSimilarity(Receipt),
+            {"rec": (Receipt(merchant="M", tax=1.0), Receipt(merchant="M", tax=1.0))},
+        )
+        merged = StructuredOutputReport.flatten([invoice, receipt])
+
+        assert type(merged) is StructuredOutputReport
+        with pytest.raises(ValueError, match=r"compares 2 models \(Invoice, Receipt\)"):
+            merged.metrics()
+        assert [entry["model"] for entry in merged.per_case()] == ["Invoice", "Receipt"]
+
+    def test_flattening_reports_of_one_schema_rolls_up(self):
+        first = _run(StructuredOutputSimilarity(Invoice), {"a": (_invoice(), _invoice())})
+        second = _run(StructuredOutputSimilarity(Invoice), {"b": (_invoice(), _invoice(vendor="Acme Corp"))})
+        merged = StructuredOutputReport.flatten([first, second])
+
+        assert merged.metrics().document_count == 2
+        assert [entry["case"] for entry in merged.per_case()] == ["a", "b"]
 
 
 class TestModelClassIsRequired:
