@@ -87,7 +87,8 @@ strands-evals/
 │   │   ├── deterministic/                    # Non-LLM evaluators
 │   │   │   ├── output.py
 │   │   │   ├── trajectory.py
-│   │   │   └── environment_state.py
+│   │   │   ├── environment_state.py
+│   │   │   └── structured_output.py          # StructuredOutputSimilarity + StructuredOutputReport (stickler extra)
 │   │   └── prompt_templates/                 # Per-evaluator prompt modules
 │   │       └── {evaluator_name}/{name}_v0.py # Exports SYSTEM_PROMPT constant
 │   │

@@ -509,7 +509,7 @@ class PolicyComplianceEvaluator(Evaluator[str, str]):
 ### Field-Level Structured Output Scoring
 
 `Equals` compares structured output with whole-object `==`, so it scores 0.0 or 1.0.
-`StructuredOutputSimilarity` compares field by field and tells you which field to fix.
+`StructuredOutputSimilarity` compares field by field and names the field to fix.
 Deterministic and offline: no LLM judge, no credentials, no per-call cost.
 
 ```python
@@ -527,74 +527,43 @@ class Invoice(BaseModel):
     total_amount: float | None = None
     line_items: list[LineItem] = []
 
-# The same model the agent already emits as structured_output_model.
-evaluator = StructuredOutputSimilarity(Invoice)
+evaluator = StructuredOutputSimilarity(Invoice)   # the model the agent emits as structured_output_model
 report = Experiment(
     cases=cases,
     evaluators=[evaluator],
-    report_cls=StructuredOutputReport,            # binds the rollups below; without it
-).run_evaluations(task)                           # you get a plain EvaluationReport
+    report_cls=StructuredOutputReport,            # adds the rollups below
+).run_evaluations(task)
 
-report.overall_score                              # weighted mean across the dataset
-report.detailed_results[0][0].metadata            # this case's field scores, plus
-                                                  # precision / recall / f1
-report.per_case()                                 # the same, as a flat table
-report.metrics().field_metrics                    # per-field confusion matrix, keyed by
-                                                  # dotted path, with cm_precision /
-                                                  # cm_recall / cm_f1 per field
-evaluator.explain()                               # the comparator chosen per field, and why
+report.per_case()                 # per-document field scores, precision, recall and f1
+report.metrics().field_metrics    # per-field confusion matrix, keyed by dotted path
+evaluator.explain()               # the comparator chosen for each field, and why
 ```
-
-Line items that arrive in a different order are the clearest case. The content is
-identical, so the extraction is correct:
 
 | | `Equals` | `StructuredOutputSimilarity` |
 |---|---|---|
 | list reordered, content identical | `0.0` | `1.0` |
 | one quantity wrong, list reordered | `0.0` | `0.9375` |
 
-In the second row `reason` reads `weakest fields: line_items=0.75`, and
-`metadata["field_scores"]` gives `{'invoice_id': 1.0, 'vendor_name': 1.0,
-'total_amount': 1.0, 'line_items': 0.75}`. `report.metrics()` reports counts against the
-nested paths too -- `line_items.sku` and `line_items.quantity` -- so a suite tells you
-which field your agent gets wrong across the whole dataset rather than only that it
-failed. One exception: a list item scoring below `match_threshold` counts as one wrong
-item under `line_items`, not under its fields. With few fields per item, a single wrong
-field can put the item below the threshold, so check the parent path's `fd` count too.
+In the second row, `reason` reads `weakest fields: line_items=0.75`, and `metrics()` reports
+nested paths such as `line_items.quantity` across the whole dataset. A list item that scores
+below `match_threshold` counts as one wrong item under its parent path, so check the `fd`
+count on `line_items` as well.
 
-The field detail rides on each report row rather than on the evaluator, so it survives
-`report.model_dump_json()` and `strands-evals run --output`. Report JSON does not depend on
-`report_cls`, so a report written without one still rolls up -- read it back as
-`StructuredOutputReport`. This is the route for anything `strands-evals run` produced: the
-CLI builds its own `Experiment` and cannot be given a `report_cls`, so it always writes the
-base class.
+**Saved reports.** The field detail is stored on each report row, so it survives
+`report.to_file()` and `strands-evals run --output`. The CLI cannot set `report_cls`, so read
+its output back with `StructuredOutputReport.from_file("report.json").metrics()`.
 
-```python
-StructuredOutputReport.from_file("report.json").metrics().field_metrics
-```
+**One schema per evaluator.** `model_cls` is required. If your agent emits more than one
+output type, run a separate `Experiment` for each.
 
-Comparison configuration is inferred from the model, so there is nothing to annotate.
-`model_cls` is required: one evaluator scores one schema. Use a separate `Experiment` per
-output type if your agent emits more than one.
+**`test_pass` on sparse schemas.** The score counts a field left blank on both sides as
+correct, so a 10-field model whose ground truth fills 2 fields scores `0.80` against an empty
+prediction. `test_pass` therefore also requires recall to clear `match_threshold`, which an
+empty prediction cannot. Each row's `metadata` carries `precision`, `recall` and `f1` for
+stricter gates. To weight the fields that matter, declare the model as a stickler
+`StructuredModel` with `ComparableField(weight=...)`, or pass `weight_hints=True`.
 
-**On sparse schemas, read `recall` or `f1`, not the score alone.** `score` credits a
-field absent on *both* sides with 1.0 -- a value the model correctly left blank is a
-value it got right -- so on a schema where most fields are usually empty those fields
-outvote the informative ones. A 10-field model whose ground truth populates 2 fields
-scores `0.80` against a prediction that returned *nothing*. `test_pass` therefore
-requires both the score and `recall` to clear `match_threshold` -- one knob bounds both
-gates, so raising it also tightens the tolerated omission rate -- and each row's
-`metadata` exposes `recall`, `precision` and `f1`, so you can audit the verdict or gate
-the two independently yourself. To make
-`score` itself reflect the fields you care about, declare the model as a stickler
-`StructuredModel` and set `ComparableField(weight=...)` on them, or pass
-`weight_hints=True` to weight ids and amounts by name.
-
-Requires the `stickler` extra:
-
-```bash
-pip install "strands-agents-evals[stickler]"
-```
+Requires the `stickler` extra: `pip install "strands-agents-evals[stickler]"`.
 
 ### Tool Usage and Parameter Evaluation
 
