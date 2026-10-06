@@ -10,20 +10,39 @@ the imports at the top of the file where the house style wants them.
 """
 
 import asyncio
+import builtins
+import datetime
+import enum
+import json
 import logging
 import tempfile
 import threading
+from decimal import Decimal
 from importlib.util import find_spec
 from pathlib import Path
 
 import pytest
-from pydantic import BaseModel, ValidationError, create_model
+from pydantic import (
+    AliasChoices,
+    AliasGenerator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    RootModel,
+    computed_field,
+    create_model,
+    model_validator,
+)
+from pydantic.alias_generators import to_camel
 from strands.agent.agent_result import AgentResult
 
-from strands_evals import Case, Experiment
-from strands_evals.evaluators import Equals, Evaluator, StructuredOutputReport, StructuredOutputSimilarity
+import strands_evals
+from strands_evals import Case, Experiment, StructuredOutputReport
+from strands_evals import evaluators as evaluators_package
+from strands_evals.evaluators import Equals, Evaluator, StructuredOutputSimilarity
+from strands_evals.evaluators.deterministic import structured_output as structured_output_module
 from strands_evals.local_file_task_result_store import LocalFileTaskResultStore
-from strands_evals.types.evaluation import NOT_APPLICABLE, EvaluationData
+from strands_evals.types.evaluation import NOT_APPLICABLE, EvaluationData, EvaluationOutput
 from strands_evals.types.evaluation_report import EvaluationReport
 
 pytestmark = pytest.mark.skipif(find_spec("stickler") is None, reason="requires the stickler extra")
@@ -97,13 +116,7 @@ class TestPerCaseOutput:
         assert outputs[0].label == "Invoice"
 
     def test_score_is_sticklers_weighted_overall(self):
-        """Not a mean of per-field scores; the weighted score stickler computed.
-
-        An earlier draft emitted one output per field and installed a custom aggregator
-        to recombine them, which required looking weights up by field name because
-        EvaluationOutput carries none. Reporting overall_score directly removes that
-        whole mechanism.
-        """
+        """Not a mean of per-field scores; the weighted score stickler computed."""
         evaluator = StructuredOutputSimilarity(Invoice, weight_hints=True)
         gt, pred = _invoice(), _invoice(iid="INV-9", vendor="Acme Corp")
 
@@ -128,8 +141,8 @@ class TestPerCaseOutput:
 class TestDetailRidesOnTheReport:
     """Field detail lives on the row, so it stays with the report.
 
-    Held on the evaluator instead, it was invisible to `strands-evals run --output`,
-    blended across reuse of one instance, and ordered by completion rather than by case.
+    That makes it visible to `strands-evals run --output`, separate per run of one instance,
+    and in case order.
     """
 
     def test_row_metadata_carries_field_scores(self):
@@ -159,7 +172,7 @@ class TestDetailRidesOnTheReport:
         assert [e["case"] for e in report.per_case()] == [f"doc-{i}" for i in range(5)]
 
     def test_detail_survives_serialization(self):
-        """The reason the detail moved. Held on the evaluator, none of this reloads."""
+        """A saved report rolls up the same as the one in memory."""
         report = _run(StructuredOutputSimilarity(Invoice), {"a": (_invoice(), _invoice(vendor="Acme Corp"))})
         reloaded = _reload(report)
 
@@ -167,7 +180,7 @@ class TestDetailRidesOnTheReport:
         assert reloaded.metrics().field_metrics == report.metrics().field_metrics
 
     def test_reusing_one_instance_does_not_blend_runs(self):
-        """Two runs of one instance used to share an accumulator and double the count."""
+        """Two runs of one instance roll up separately."""
         evaluator = StructuredOutputSimilarity(Invoice)
         first = _run(evaluator, {"a": (_invoice(), _invoice())})
         second = _run(evaluator, {"b": (_invoice(), _invoice())})
@@ -430,10 +443,8 @@ class TestFlattenedReports:
 
 
 class TestModelClassIsRequired:
-    """Inferring the class per case silently scored 0 on any case loaded from JSON.
-
-    `Experiment.from_file()` datasets and a warm `LocalFileTaskResultStore` both hand
-    back `expected_output` as a dict, which no longer carries its class.
+    """The class is what reads a case back: `Experiment.from_file()` datasets and a warm
+    `LocalFileTaskResultStore` both hand values back as dicts, which carry no class.
     """
 
     def test_model_cls_is_required(self):
@@ -444,41 +455,8 @@ class TestModelClassIsRequired:
         with pytest.raises(TypeError, match="Pydantic model class"):
             StructuredOutputSimilarity(dict)
 
-    def test_dicts_score_the_same_as_instances(self):
-        """A declared class coerces a dict, so nothing depends on the class surviving."""
-        gt, pred = _invoice(), _invoice(vendor="Acme Corp")
-        evaluator = StructuredOutputSimilarity(Invoice)
-
-        from_models = evaluator.evaluate(_data(gt, pred))[0].score
-        from_dicts = evaluator.evaluate(_data(gt.model_dump(), pred.model_dump()))[0].score
-
-        assert from_dicts == pytest.approx(from_models)
-
-    def test_a_warm_cache_scores_the_same_as_a_cold_one(self):
-        """The reviewer's repro. Inferred mode scored run 1 at 1.0 and run 2 at 0.0:
-        `LocalFileTaskResultStore` returns `actual_output` as a dict, which carried no
-        class to infer, so every cached case failed."""
-        gt, pred = _invoice(), _invoice(vendor="Acme Corp")
-
-        with tempfile.TemporaryDirectory() as directory:
-            store = LocalFileTaskResultStore(Path(directory))
-            cases = [_case("a", gt)]
-
-            def run():
-                return asyncio.run(
-                    Experiment(
-                        cases=cases,
-                        evaluators=[StructuredOutputSimilarity(Invoice)],
-                    ).run_evaluations_async(lambda c: pred, evaluation_data_store=store)
-                )
-
-            cold, warm = run(), run()
-
-        assert warm.scores == pytest.approx(cold.scores)
-        assert "could not compare" not in (warm.reasons[0] or "")
-
     def test_an_unsupported_model_fails_at_construction(self):
-        """A self-referencing model used to be accepted, then fail every case."""
+        """A model stickler cannot compare fails at construction, not on every case."""
 
         class Node(BaseModel):
             name: str
@@ -486,12 +464,12 @@ class TestModelClassIsRequired:
 
         Node.model_rebuild()
 
-        with pytest.raises(Exception, match="recursive"):
+        with pytest.raises(TypeError, match="recursive"):
             StructuredOutputSimilarity(Node)
 
 
 class TestSerialization:
-    """`Experiment.to_file()` used to raise on an experiment carrying this evaluator."""
+    """The evaluator round-trips through `Experiment.to_file()` and `from_file()`."""
 
     def test_to_dict_emits_a_dotted_path(self):
         evaluator = StructuredOutputSimilarity(Invoice)
@@ -499,7 +477,19 @@ class TestSerialization:
         assert evaluator.to_dict() == {
             "evaluator_type": "StructuredOutputSimilarity",
             "model_cls": f"{Invoice.__module__}.Invoice",
+            "match_threshold": 0.7,
+            "weight_hints": False,
         }
+
+    def test_the_settings_the_comparison_is_built_from_are_read_only(self):
+        """Changing one after construction would split the verdict from the saved settings."""
+        evaluator = StructuredOutputSimilarity(Invoice, match_threshold=0.8, weight_hints=True)
+
+        with pytest.raises(AttributeError):
+            evaluator.match_threshold = 0.4
+        with pytest.raises(AttributeError):
+            evaluator.weight_hints = False
+        assert (evaluator.match_threshold, evaluator.weight_hints) == (0.8, True)
 
     def test_round_trips_through_file(self, tmp_path):
         path = tmp_path / "experiment.json"
@@ -512,7 +502,7 @@ class TestSerialization:
 
         assert isinstance(restored, StructuredOutputSimilarity)
         assert restored.model_cls is Invoice
-        assert restored.match_threshold == 0.8
+        assert (restored.match_threshold, restored.weight_hints) == (0.8, False)
 
     def test_a_reloaded_experiment_scores_the_same(self, tmp_path):
         path = tmp_path / "experiment.json"
@@ -546,8 +536,8 @@ class TestCasesWithNothingToScore:
         (row,) = report.detailed_results[0]
         assert row.score == 0.0
         assert row.test_pass is False
-        assert "could not compare as Invoice" in (row.reason or "")
-        assert row.metadata == {"error": "validation_failed"}
+        assert row.reason.startswith("could not compare as Invoice: actual_output is a string that is not JSON")
+        assert row.metadata == {"error": "unreadable"}
         assert "Evaluator error" not in (row.reason or ""), "the harness never saw an exception"
 
     def test_a_failed_case_is_excluded_from_the_rollup_but_visible(self):
@@ -560,14 +550,16 @@ class TestCasesWithNothingToScore:
         assert len(report.scores) == 2
         assert report.metrics().document_count == 1
         assert [e["case"] for e in report.per_case()] == ["good"]
-        assert any(row.metadata == {"error": "validation_failed"} for rows in report.detailed_results for row in rows)
+        assert any(row.metadata == {"error": "unreadable"} for rows in report.detailed_results for row in rows)
 
-    def test_a_foreign_ground_truth_is_not_applicable(self):
-        """A case belonging to another schema is not this evaluator's to judge.
+    def test_a_foreign_ground_truth_is_a_visible_failure(self):
+        """A case belonging to another schema fails, rather than being skipped.
 
-        Coercing it was actively harmful: `model_validate(other.model_dump())` drops every
-        unrecognized key, because Pydantic ignores extras by default, so an all-optional
-        target model came out blank on both sides and scored a perfect 1.0.
+        Reading it as the model would drop every unrecognized key, because Pydantic ignores
+        extras, so an all-optional model came out blank on both sides and scored a perfect
+        1.0. Skipping it instead would hide it: a not-applicable row passes and leaves the
+        mean, and the same case read back from a result store is a dict, which must get the
+        same answer.
         """
         report = _run(
             StructuredOutputSimilarity(Invoice),
@@ -575,33 +567,18 @@ class TestCasesWithNothingToScore:
         )
 
         (row,) = report.detailed_results[0]
-        assert row.label == NOT_APPLICABLE
-        assert row.not_applicable is True
-        assert "are not on Invoice" in (row.reason or "")
-
-    def test_an_all_optional_schema_does_not_score_a_foreign_case_as_perfect(self):
-        """The regression that motivated the check, on the shape that triggers it."""
-
-        class Sparse(BaseModel):
-            invoice_id: str | None = None
-            vendor_name: str | None = None
-
-        class Person(BaseModel):
-            name: str | None = None
-            email: str | None = None
-
-        person = Person(name="Ada", email="ada@example.com")
-        outputs = StructuredOutputSimilarity(Sparse).evaluate(_data(person, person))
-
-        assert outputs[0].label == NOT_APPLICABLE
-        assert outputs[0].score != 1.0, "a Person must never score as a perfect Sparse"
+        assert (row.score, row.test_pass, row.label) == (0.0, False, "Invoice")
+        assert row.not_applicable is False
+        assert row.reason == (
+            "could not compare as Invoice: expected_output (Receipt) has keys merchant, tax, "
+            "none of which is a field of Invoice"
+        )
 
     def test_a_redefined_class_with_the_same_fields_still_scores(self):
         """Re-running a notebook cell creates a new class object with the same fields.
 
-        Instances of the old class then fail `isinstance` against the new one, so a check
-        on class identity made every case not-applicable and the suite scored 0.0.
-        Nothing is dropped converting between them, so they are scored.
+        Instances of the old class fail `isinstance` against the new one, but they are read
+        through their fields, so they are scored.
         """
         old = create_model("Invoice", invoice_id=(str, ...), vendor_name=(str | None, None))
         new = create_model("Invoice", invoice_id=(str, ...), vendor_name=(str | None, None))
@@ -613,13 +590,6 @@ class TestCasesWithNothingToScore:
 
         assert outputs[0].label == "Invoice"
         assert outputs[0].score == 1.0
-
-    def test_a_foreign_ground_truth_reason_names_the_dropped_fields(self):
-        outputs = StructuredOutputSimilarity(Invoice).evaluate(
-            _data(Receipt(merchant="M", tax=1.0), Receipt(merchant="M", tax=1.0))
-        )
-
-        assert "merchant, tax" in (outputs[0].reason or "")
 
     def test_an_agent_result_is_unwrapped(self):
         """Returning the agent's result directly is the natural way to write the task."""
@@ -649,21 +619,13 @@ class TestCasesWithNothingToScore:
         assert outputs[0].score == 0.0
         assert "structured_output_model=Invoice" in (outputs[0].reason or "")
 
-    def test_a_foreign_actual_output_is_a_scored_failure(self):
-        """The agent emitting the wrong model is a failure, not a blank comparison."""
-        outputs = StructuredOutputSimilarity(Invoice).evaluate(_data(_invoice(), Receipt(merchant="M", tax=1.0)))
+    def test_a_mixed_schema_suite_fails_its_cross_pairs_but_rolls_up_each_schema(self):
+        """Every evaluator runs over every case; cross pairs sharing no field name fail visibly.
 
-        assert outputs[0].score == 0.0
-        assert outputs[0].test_pass is False
-        assert outputs[0].metadata == {"error": "validation_failed"}
-
-    def test_a_mixed_schema_suite_scores_each_schema_once(self):
-        """Every evaluator runs over every case, so cross pairs must not count.
-
-        Not a recommended layout -- the README says one `Experiment` per schema -- but a
-        caller can still build it, and before the not-applicable check it reported
-        `overall 1.0` with all four rows passing and `document_count` 2 for a one-invoice
-        suite. That is the false pass this pins shut.
+        Not a supported layout -- the README says one `Experiment` per schema -- and schemas
+        that share a field name are read as each other. Read blank, the cross pairs would pass
+        at 1.0 and double each schema's `document_count`; failing them says to split the suite,
+        and each schema's rollup still counts only its own case.
         """
 
         class Sparse(BaseModel):
@@ -689,8 +651,8 @@ class TestCasesWithNothingToScore:
 
         assert report.metrics(evaluator="invoice").document_count == 1
         assert report.metrics(evaluator="person").document_count == 1
-        assert report.overall_score == pytest.approx(1.0), "the cross pairs must not drag the mean"
-        assert sum(1 for rows in report.detailed_results for row in rows if row.not_applicable) == 2
+        assert sorted(report.test_passes) == [False, False, True, True]
+        assert report.overall_score == pytest.approx(0.5), "the cross pairs are failures, not dropped rows"
 
 
 class TestConcurrency:
@@ -745,10 +707,15 @@ class TestCoercion:
 
     def test_an_unusable_type_is_reported_not_raised(self):
         evaluator = StructuredOutputSimilarity(Invoice)
-        outputs = evaluator.evaluate(_data(_invoice(), 42))
+        scalar = evaluator.evaluate(_data(_invoice(), 42))[0]
+        unknown = evaluator.evaluate(_data(_invoice(), object()))[0]
 
-        assert outputs[0].score == 0.0
-        assert "an AgentResult, a dict, or a JSON string" in (outputs[0].reason or "")
+        expected = (
+            "could not compare as Invoice: actual_output must be an instance of Invoice, "
+            "an AgentResult, a dict, or a JSON object; got"
+        )
+        assert (scalar.score, scalar.reason) == (0.0, f"{expected} int")
+        assert (unknown.score, unknown.reason) == (0.0, f"{expected} object")
 
     def test_a_model_class_accepts_its_own_dotted_path(self):
         evaluator = StructuredOutputSimilarity(f"{Invoice.__module__}.Invoice")
@@ -971,8 +938,6 @@ class TestPassRequiresFindingSomething:
 class TestWithoutTheExtra:
     def test_the_import_error_names_the_extra(self, monkeypatch):
         """Constructing without stickler installed must say how to fix it."""
-        import builtins
-
         real_import = builtins.__import__
 
         def fake_import(name, *args, **kwargs):
@@ -986,7 +951,644 @@ class TestWithoutTheExtra:
             StructuredOutputSimilarity(Invoice)
 
 
-def test_validation_error_is_still_raised_by_pydantic_itself():
-    """Sanity check on the type the evaluator catches."""
-    with pytest.raises(ValidationError):
-        Invoice.model_validate({"not": "an invoice"})
+class _CamelLine(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel)
+    sku_code: str | None = None
+    unit_count: int | None = None
+
+
+class _CamelInvoice(BaseModel):
+    """Aliased the way an agent emitting camelCase JSON is: aliases only, no populate_by_name."""
+
+    model_config = ConfigDict(alias_generator=to_camel)
+    invoice_id: str
+    vendor_name: str | None = None
+    line_items: list[_CamelLine] = []
+
+
+class _AllOptional(BaseModel):
+    """Sparse: most fields blank in ground truth, which is where blank-vs-blank scores 1.0."""
+
+    invoice_id: str | None = None
+    vendor_name: str | None = None
+    po_number: str | None = None
+    notes: str | None = None
+    total_amount: float | None = None
+
+
+class _CamelAllOptional(BaseModel):
+    """Aliased and all-optional: a dict by field name must not read as blank on both sides."""
+
+    model_config = ConfigDict(alias_generator=to_camel)
+    vendor_name: str | None = None
+    total_amount: float | None = None
+
+
+class _Status(str, enum.Enum):
+    PAID = "paid"
+    OPEN = "open"
+
+
+class _TypedValues(BaseModel):
+    """Values whose form changes between a model instance, a dict and JSON."""
+
+    invoice_date: datetime.date | None = None
+    status: _Status | None = None
+    amount: Decimal | None = None
+
+
+class _ValidationAliased(BaseModel):
+    """Keys pydantic accepts only through validation aliases, not `alias`."""
+
+    model_config = ConfigDict(alias_generator=AliasGenerator(validation_alias=to_camel))
+    vendor_name: str | None = None
+    invoice_id: str | None = Field(None, validation_alias=AliasChoices("invoiceNo", "invoice_id"))
+
+
+class _ExtraAllowed(BaseModel):
+    """Extra keys are kept by pydantic but are not fields, so they must not count as an overlap."""
+
+    model_config = ConfigDict(extra="allow")
+    invoice_id: str | None = None
+    vendor_name: str | None = None
+
+
+class _Strict(BaseModel):
+    """Strict models reject a date given as a string in Python mode, which is how stores hold it."""
+
+    model_config = ConfigDict(strict=True)
+    invoice_date: datetime.date | None = None
+    paid_at: datetime.datetime | None = Field(None, strict=True)
+
+
+class _Tier(enum.Enum):
+    GOLD = "gold"
+    SILVER = "silver"
+
+
+class _PlainEnum(BaseModel):
+    tier: _Tier | None = None
+    vendor_name: str | None = None
+
+
+class _Forbidding(BaseModel):
+    """Annotation keys in ground truth must not make a forbidding model fail validation."""
+
+    model_config = ConfigDict(extra="forbid")
+    invoice_id: str | None = None
+    vendor_name: str | None = None
+
+
+class _Person(BaseModel):
+    patient: str | None = None
+    diagnosis: str | None = None
+
+
+# (model, correct ground truth, a prediction wrong on every populated field), as field-name dicts
+_SHAPES = {
+    "plain-nested": (
+        Invoice,
+        {
+            "invoice_id": "INV-1",
+            "vendor_name": "Acme Corporation",
+            "total_amount": 100.0,
+            "line_items": [{"sku": "SKU-1", "unit_price": 100.0}],
+        },
+        {
+            "invoice_id": "ZZZ-9",
+            "vendor_name": "Zeta Industries GmbH",
+            "total_amount": 9.0,
+            "line_items": [{"sku": "QQQ", "unit_price": 1.0}],
+        },
+    ),
+    "aliased-nested": (
+        _CamelInvoice,
+        {
+            "invoice_id": "INV-1",
+            "vendor_name": "Acme Corporation",
+            "line_items": [{"sku_code": "SKU-1", "unit_count": 4}],
+        },
+        {
+            "invoice_id": "ZZZ-9",
+            "vendor_name": "Zeta Industries GmbH",
+            "line_items": [{"sku_code": "QQQ", "unit_count": 9}],
+        },
+    ),
+    "aliased-all-optional": (
+        _CamelAllOptional,
+        {"vendor_name": "Acme Corporation", "total_amount": 5.0},
+        {"vendor_name": "Zeta Industries GmbH", "total_amount": 99.0},
+    ),
+    "typed-values": (
+        _TypedValues,
+        {"invoice_date": datetime.date(2026, 3, 14), "status": _Status.PAID, "amount": Decimal("12.50")},
+        {"invoice_date": datetime.date(2025, 1, 1), "status": _Status.OPEN, "amount": Decimal("99.00")},
+    ),
+    "validation-aliased": (
+        _ValidationAliased,
+        {"vendor_name": "Acme Corporation", "invoice_id": "INV-1"},
+        {"vendor_name": "Zeta Industries GmbH", "invoice_id": "ZZZ-9"},
+    ),
+    "extra-allowed": (
+        _ExtraAllowed,
+        {"invoice_id": "INV-1", "vendor_name": "Acme Corporation"},
+        {"invoice_id": "ZZZ-9", "vendor_name": "Zeta Industries GmbH"},
+    ),
+    "strict-typed": (
+        _Strict,
+        {"invoice_date": datetime.date(2026, 3, 14), "paid_at": datetime.datetime(2026, 3, 14, 9, 30)},
+        {"invoice_date": datetime.date(2025, 1, 1), "paid_at": datetime.datetime(2025, 1, 1, 8, 0)},
+    ),
+    "plain-enum": (
+        _PlainEnum,
+        {"tier": _Tier.GOLD, "vendor_name": "Acme Corporation"},
+        {"tier": _Tier.SILVER, "vendor_name": "Zeta Industries GmbH"},
+    ),
+    "forbid-extra": (
+        _Forbidding,
+        {"invoice_id": "INV-1", "vendor_name": "Acme Corporation"},
+        {"invoice_id": "ZZZ-9", "vendor_name": "Zeta Industries GmbH"},
+    ),
+    "all-optional": (
+        _AllOptional,
+        {"invoice_id": "INV-1", "vendor_name": "Acme Corporation"},
+        {"invoice_id": "ZZZ-9", "vendor_name": "Zeta Industries GmbH"},
+    ),
+}
+
+
+def _forms(instance, with_agent_result=False):
+    """Every representation a case value reaches the evaluator in."""
+    forms = {
+        "instance": instance,
+        "dict-by-name": instance.model_dump(),
+        "dict-by-alias": instance.model_dump(by_alias=True),
+        "json-by-name": instance.model_dump_json(),
+        "json-by-alias": instance.model_dump_json(by_alias=True),
+    }
+    if with_agent_result:
+        forms["agent-result"] = AgentResult(
+            stop_reason="end_turn",
+            message={"role": "assistant", "content": []},
+            metrics=None,
+            state={},
+            structured_output=instance,
+        )
+    return forms
+
+
+@pytest.mark.parametrize("shape", sorted(_SHAPES))
+class TestEveryInputForm:
+    """Every ground-truth form against every prediction form, per model shape.
+
+    Feeding one representation at a time misses false passes that only one form produces,
+    such as an aliased model read from a dict by field name. This covers the forms a value
+    reaches the evaluator in and the model shapes listed in `_SHAPES`; a new shape or form
+    belongs here rather than in a one-off test.
+    """
+
+    def _instances(self, shape):
+        model, truth, wrong = _SHAPES[shape]
+        return model, model.model_validate(truth, by_name=True), model.model_validate(wrong, by_name=True)
+
+    def _score_all(self, model, truths, predictions):
+        evaluator = StructuredOutputSimilarity(model)
+        return [
+            (e, a, evaluator.evaluate(_data(expected, actual))[0])
+            for e, expected in truths.items()
+            for a, actual in predictions.items()
+        ]
+
+    def _variants(self, model, truth):
+        """Predictions that leave one populated optional field blank."""
+        # Required fields cannot be blank in a valid instance; the wrong-value property covers them.
+        populated = {
+            k: v
+            for k, v in truth.model_dump().items()
+            if v not in (None, [], "") and not model.model_fields[k].is_required()
+        }
+        variants = {}
+        for field, value in populated.items():
+            blank = model.model_validate(
+                {**truth.model_dump(), field: None if not isinstance(value, list) else []}, by_name=True
+            )
+            variants[f"{field}-blank"] = blank
+        return variants
+
+    def test_a_correct_prediction_scores_one_in_every_form(self, shape):
+        model, truth, _ = self._instances(shape)
+        rows = self._score_all(model, _forms(truth, True), _forms(truth, True))
+        bad = [(e, a, o.score, o.reason) for e, a, o in rows if not (o.score == 1.0 and o.test_pass)]
+        assert bad == [], f"correct prediction did not score 1.0 / pass: {bad}"
+
+    def test_a_wrong_prediction_never_passes_in_any_form(self, shape):
+        model, truth, wrong = self._instances(shape)
+        rows = self._score_all(model, _forms(truth, True), _forms(wrong, True))
+        bad = [(e, a, o.score, o.reason) for e, a, o in rows if o.test_pass or o.score == 1.0]
+        assert bad == [], f"wrong prediction passed: {bad}"
+
+    def test_a_prediction_missing_any_one_field_never_scores_one(self, shape):
+        model, truth, _ = self._instances(shape)
+        for variant, prediction in self._variants(model, truth).items():
+            rows = self._score_all(model, _forms(truth, True), _forms(prediction, True))
+            bad = [(e, a, o.score) for e, a, o in rows if o.score == 1.0]
+            assert bad == [], f"{variant} scored 1.0: {bad}"
+
+    def test_ground_truth_of_another_schema_fails_in_every_form(self, shape):
+        model, truth, _ = self._instances(shape)
+        rows = self._score_all(model, _forms(_Person(patient="Jo", diagnosis="flu"), True), _forms(truth))
+        bad = [(e, o.label, o.score, o.reason) for e, _, o in rows if o.test_pass or o.score > 0.0 or o.not_applicable]
+        assert bad == [], f"foreign ground truth did not fail: {bad}"
+
+    def test_a_prediction_of_another_schema_never_passes(self, shape):
+        model, truth, _ = self._instances(shape)
+        rows = self._score_all(model, _forms(truth, True), _forms(_Person(patient="Jo", diagnosis="flu"), True))
+        bad = [(e, a, o.score, o.reason) for e, a, o in rows if o.test_pass or o.score > 0.0]
+        assert bad == [], f"foreign prediction scored: {bad}"
+
+    def test_extra_annotation_keys_on_ground_truth_are_ignored(self, shape):
+        """Dataset files carry keys like an annotator id; they are ignored, not failed."""
+        model, truth, wrong = self._instances(shape)
+        annotated = {**truth.model_dump(mode="json"), "annotator": "bob"}
+        truths = {"dict": annotated, "json": json.dumps(annotated)}
+        correct = self._score_all(model, truths, _forms(truth))
+        assert [(e, a, o.score) for e, a, o in correct if not (o.score == 1.0 and o.test_pass)] == []
+        incorrect = self._score_all(model, truths, _forms(wrong))
+        assert [(e, a, o.label, o.score) for e, a, o in incorrect if o.test_pass or o.label == NOT_APPLICABLE] == []
+
+    @pytest.mark.parametrize("prediction", ["correct", "wrong", "foreign-truth"])
+    def test_a_warm_cache_and_a_reloaded_experiment_score_like_a_cold_run(self, shape, prediction, tmp_path):
+        """The two places a case becomes a field-name dict between runs.
+
+        Every direction matters: a cached dict must not turn a wrong prediction into a pass, a
+        strict model must not turn a correct one into a failure, and ground truth of another
+        schema must fail as a dict just as it does as an instance. The dataset file is written
+        with JSON-mode values, as a dataset file holds them: `Experiment.to_file` itself
+        cannot serialize a `date` in a case, for any evaluator.
+        """
+        model, truth, wrong = self._instances(shape)
+        answer = wrong if prediction == "wrong" else truth
+        if prediction == "foreign-truth":
+            truth = _Person(patient="Jo", diagnosis="flu")
+        cases = [_case("c", truth)]
+
+        def run(experiment, **kwargs):
+            return asyncio.run(experiment.run_evaluations_async(lambda c: answer, **kwargs))
+
+        store = LocalFileTaskResultStore(tmp_path / "store")
+        cold = run(Experiment(cases=cases, evaluators=[StructuredOutputSimilarity(model)]), evaluation_data_store=store)
+        warm = run(Experiment(cases=cases, evaluators=[StructuredOutputSimilarity(model)]), evaluation_data_store=store)
+        path = tmp_path / "experiment.json"
+        file_cases = [_case("c", truth.model_dump(mode="json"))]
+        Experiment(cases=file_cases, evaluators=[StructuredOutputSimilarity(model)]).to_file(path)
+        reloaded = run(Experiment.from_file(path))
+
+        assert cold.test_passes == [prediction == "correct"]
+        assert warm.scores == pytest.approx(cold.scores) and warm.test_passes == cold.test_passes
+        assert reloaded.scores == pytest.approx(cold.scores) and reloaded.test_passes == cold.test_passes
+
+
+class _GenericMetadataEvaluator(Evaluator):
+    """A sibling evaluator using the obvious metadata names, which this evaluator also uses."""
+
+    def evaluate(self, evaluation_case):
+        return [EvaluationOutput(score=1.0, test_pass=True, metadata={"precision": 1.0, "recall": 1.0, "f1": 1.0})]
+
+
+class TestSharingAReportWithOtherEvaluators:
+    def test_a_sibling_evaluator_using_generic_metadata_keys_is_ignored(self):
+        """`metadata` is open to every evaluator, so rows are selected on `evaluated_by`.
+
+        Selecting on any detail key read the sibling's well-formed row as a corrupted one of ours.
+        """
+        report = Experiment(
+            cases=[_case("c1", _invoice())],
+            evaluators=[StructuredOutputSimilarity(Invoice), _GenericMetadataEvaluator()],
+            report_cls=StructuredOutputReport,
+        ).run_evaluations(lambda c: _invoice())
+
+        assert report.metrics(evaluator="StructuredOutputSimilarity").document_count == 1
+        assert [entry["evaluator"] for entry in report.per_case()] == ["StructuredOutputSimilarity"]
+
+    def test_per_case_names_the_evaluator_of_each_row(self):
+        """Two instances on one report would otherwise produce identical-looking rows."""
+        report = Experiment(
+            cases=[_case("c1", _invoice())],
+            evaluators=[
+                StructuredOutputSimilarity(Invoice, name="strict"),
+                StructuredOutputSimilarity(Invoice, name="loose", match_threshold=0.5),
+            ],
+            report_cls=StructuredOutputReport,
+        ).run_evaluations(lambda c: _invoice(vendor="Acme Corp"))
+
+        assert sorted(entry["evaluator"] for entry in report.per_case()) == ["loose", "strict"]
+
+    def test_the_reason_names_the_side_that_failed_to_validate(self):
+        """A broken ground-truth row must not read as a failing prediction."""
+        outputs = StructuredOutputSimilarity(Invoice).evaluate(_data({"invoice_id": "I1"}, _invoice()))
+
+        assert (outputs[0].reason or "").startswith("could not compare as Invoice: expected_output did not validate")
+
+
+def test_the_report_is_importable_from_the_top_level_package():
+    """Beside `EvaluationReport`, which it subclasses; the `evaluators` path keeps working."""
+    assert "StructuredOutputReport" in strands_evals.__all__
+    assert evaluators_package.StructuredOutputReport is StructuredOutputReport
+
+
+class TestReadingValues:
+    """Reading behaviors the input-form sweep cannot express."""
+
+    def test_a_redefined_enum_reads_by_value(self):
+        """Re-running a notebook cell redefines the enum too; its members must still read."""
+
+        def define():
+            class Status(enum.Enum):
+                PAID = "paid"
+
+            class Inv(BaseModel):
+                status: Status | None = None
+
+            return Inv, Status
+
+        old_model, old_status = define()
+        new_model, new_status = define()
+        outputs = StructuredOutputSimilarity(new_model).evaluate(
+            _data(new_model(status=new_status.PAID), old_model(status=old_status.PAID))
+        )
+
+        assert outputs[0].score == 1.0 and outputs[0].test_pass
+
+    def test_a_computed_field_on_a_redefined_class_is_ignored(self):
+        """`model_dump` includes computed fields, which a forbidding model would reject."""
+
+        class Computing(BaseModel):
+            invoice_id: str | None = None
+            vendor_name: str | None = None
+
+            @computed_field
+            @property
+            def upper(self) -> str:
+                return (self.vendor_name or "").upper()
+
+        prediction = Computing(invoice_id="INV-1", vendor_name="Acme")
+        outputs = StructuredOutputSimilarity(_Forbidding).evaluate(
+            _data(_Forbidding(invoice_id="INV-1", vendor_name="Acme"), prediction)
+        )
+
+        assert outputs[0].score == 1.0 and outputs[0].test_pass
+
+    def test_a_nested_computed_field_on_a_forbidding_model_survives_a_warm_cache(self, tmp_path):
+        """The store writes computed fields; the forbidding inner model rejects them on reload."""
+
+        class Line(BaseModel):
+            model_config = ConfigDict(extra="forbid")
+            unit: float
+            count: int
+
+            @computed_field
+            @property
+            def total(self) -> float:
+                return self.unit * self.count
+
+        class Order(BaseModel):
+            lines: list[Line] = []
+
+        truth = Order(lines=[Line(unit=2.0, count=3)])
+        store = LocalFileTaskResultStore(tmp_path)
+        runs = [
+            asyncio.run(
+                Experiment(
+                    cases=[_case("c", truth)], evaluators=[StructuredOutputSimilarity(Order)]
+                ).run_evaluations_async(lambda c: truth, evaluation_data_store=store)
+            )
+            for _ in ("cold", "warm")
+        ]
+
+        assert [(run.scores[0], run.test_passes[0]) for run in runs] == [(1.0, True), (1.0, True)]
+
+    def test_an_extra_key_inside_a_forbidding_union_member_is_ignored(self):
+        """Extras are ignored at every level, so a union member's annotation cannot fail the case."""
+
+        class Cat(BaseModel):
+            model_config = ConfigDict(extra="forbid")
+            lives: int
+
+        class Dog(BaseModel):
+            model_config = ConfigDict(extra="forbid")
+            barks: bool
+
+        class Pet(BaseModel):
+            pet: Cat | Dog | None = None
+
+        outputs = StructuredOutputSimilarity(Pet).evaluate(
+            _data({"pet": {"lives": 9, "annotator": "bob"}}, Pet(pet=Cat(lives=9)))
+        )
+
+        assert outputs[0].score == 1.0 and outputs[0].test_pass
+
+    def test_a_shared_key_scores_on_the_schema_fields_and_ignores_the_rest(self):
+        """Pinned on purpose: only a value with no field of the model is another schema.
+
+        Treating partial overlap as foreign would fail annotated datasets. The evaluator
+        scores what its schema defines.
+        """
+
+        class Keyed(BaseModel):
+            id: str | None = None
+            vendor: str | None = None
+
+        outputs = StructuredOutputSimilarity(Keyed).evaluate(
+            _data({"id": "A", "vendor": "Acme"}, {"id": "A", "vendor": "Acme", "receipt_no": "x"})
+        )
+
+        assert outputs[0].label == "Keyed" and outputs[0].score == 1.0
+
+    def test_a_validation_alias_key_reads(self):
+        camel = {"vendorName": "Acme Corporation", "invoiceNo": "INV-1"}
+        outputs = StructuredOutputSimilarity(_ValidationAliased).evaluate(
+            _data(camel, _ValidationAliased.model_validate(camel))
+        )
+
+        assert outputs[0].score == 1.0 and outputs[0].test_pass
+
+    def test_bytes_in_a_python_dict_read_natively(self):
+        class Blob(BaseModel):
+            model_config = ConfigDict(val_json_bytes="base64")
+            blob: bytes | None = None
+
+        outputs = StructuredOutputSimilarity(Blob).evaluate(_data(Blob(blob=b"hello"), {"blob": b"hello"}))
+
+        assert outputs[0].score == 1.0 and outputs[0].test_pass
+
+    def test_a_normalizing_validator_still_reads_dicts(self):
+        """A validator that rewrites a field on every input does not make dict cases unreadable."""
+
+        class Classification(BaseModel):
+            label: str = "unknown"
+
+            @model_validator(mode="after")
+            def lower(self):
+                self.label = self.label.lower()
+                return self
+
+        evaluator = StructuredOutputSimilarity(Classification)
+        wrong = evaluator.evaluate(_data({"label": "Positive"}, {"label": "negative"}))[0]
+        right = evaluator.evaluate(_data({"label": "Positive"}, '{"label": "POSITIVE"}'))[0]
+
+        assert (wrong.label, wrong.test_pass) == ("Classification", False)
+        assert (right.score, right.test_pass) == (1.0, True)
+
+    def test_ground_truth_stating_a_default_value_is_read(self):
+        """`count: 0` is a real annotation, even though it equals the default."""
+
+        class Counted(BaseModel):
+            count: int = 0
+
+        outputs = StructuredOutputSimilarity(Counted).evaluate(_data({"count": 0}, {"count": 3}))
+
+        assert outputs[0].label == "Counted" and outputs[0].test_pass is False
+
+    def test_two_blank_documents_are_a_match(self):
+        """By design: an empty object is a blank document of this schema, not another schema."""
+        outputs = StructuredOutputSimilarity(_AllOptional).evaluate(_data("{}", {}))
+
+        assert outputs[0].label == "_AllOptional" and outputs[0].score == 1.0
+
+    def test_an_old_pydantic_is_reported_at_construction(self, monkeypatch):
+        """`model_validate(extra=...)` needs 2.12; otherwise every case would fail on a TypeError."""
+        monkeypatch.setattr(structured_output_module, "PYDANTIC_VERSION", "2.11.7")
+
+        with pytest.raises(ImportError, match=r"requires pydantic>=2\.12 \(found 2\.11\.7\)"):
+            StructuredOutputSimilarity(Invoice)
+
+    @pytest.mark.parametrize("model_cls", [RootModel[dict[str, str]], create_model("Empty")], ids=["root", "empty"])
+    def test_a_model_without_named_fields_is_rejected_at_construction(self, model_cls):
+        """Values are recognized by field name; a RootModel's cached form has no `root` key."""
+        with pytest.raises(TypeError, match="must have named fields to compare"):
+            StructuredOutputSimilarity(model_cls)
+
+
+class TestAValueOfAnotherSchemaFails:
+    """A value is another schema when it has keys and none of them is a field of the model.
+
+    Such a value fails, on either side and in any form, with a reason naming its keys. The
+    rule is on keys alone, so it does not depend on what the model's validators do.
+    """
+
+    def test_the_reason_lists_the_keys_and_the_form(self):
+        outputs = StructuredOutputSimilarity(Invoice).evaluate(_data('{"patient": "Jo"}', _invoice()))
+
+        assert outputs[0].reason == (
+            "could not compare as Invoice: expected_output (JSON dict) has keys patient, "
+            "none of which is a field of Invoice"
+        )
+
+    def test_an_agent_result_holding_another_model_fails(self):
+        result = AgentResult(
+            stop_reason="end_turn",
+            message={"role": "assistant", "content": []},
+            metrics=None,
+            state={},
+            structured_output=Receipt(merchant="M", tax=1.0),
+        )
+        outputs = StructuredOutputSimilarity(Invoice).evaluate(_data(_invoice(), result))
+
+        assert outputs[0].test_pass is False
+        assert "actual_output (Receipt) has keys merchant, tax" in (outputs[0].reason or "")
+
+    def test_a_key_only_the_alias_reads_is_not_a_field_when_aliases_are_off(self):
+        class NameOnly(BaseModel):
+            model_config = ConfigDict(validate_by_alias=False, validate_by_name=True)
+            invoice_id: str | None = Field(None, alias="InvoiceID")
+
+        outputs = StructuredOutputSimilarity(NameOnly).evaluate(_data({"invoice_id": "1"}, {"InvoiceID": "1"}))
+
+        assert outputs[0].test_pass is False
+        assert "has keys InvoiceID, none of which is a field of NameOnly" in (outputs[0].reason or "")
+
+    def test_a_validation_alias_replaces_the_alias_for_reading(self):
+        """pydantic reads `total_in`, not `Total`; a value keyed only by `Total` is another schema."""
+
+        class Overridden(BaseModel):
+            total: float | None = Field(None, alias="Total", validation_alias="total_in")
+
+        truth = {"total_in": 5.0}
+        assert StructuredOutputSimilarity(Overridden).evaluate(_data(truth, {"total_in": 5.0}))[0].score == 1.0
+        unreadable = StructuredOutputSimilarity(Overridden).evaluate(_data({"Total": 5.0}, Overridden()))[0]
+        assert unreadable.test_pass is False and "has keys Total" in (unreadable.reason or "")
+
+    def test_a_validator_that_sets_a_field_for_any_input_does_not_make_a_foreign_value_readable(self):
+        """A field a validator sets for any input does not make a foreign value read as the model."""
+
+        class Derived(BaseModel):
+            name: str | None = None
+            length: int = 0
+
+            @model_validator(mode="after")
+            def measure(self):
+                self.length = len(self.name or "")
+                return self
+
+        outputs = StructuredOutputSimilarity(Derived).evaluate(_data({"other": 1}, {"zzz": 1}))
+
+        assert outputs[0].test_pass is False and outputs[0].score == 0.0
+        correct = StructuredOutputSimilarity(Derived).evaluate(_data({"name": "Ada"}, {"name": "Ada"}))
+        assert correct[0].score == 1.0
+
+    def test_keys_only_a_validator_understands_fail_rather_than_being_guessed_at(self):
+        """Pinned on purpose: the rule reads keys, not validators, so it cannot misjudge one.
+
+        A model that maps `full_name` onto its fields still scores its own instances, and a
+        result store writes field names, so only a hand-written dataset meets this, and it
+        is told which keys were not recognized.
+        """
+
+        class Name(BaseModel):
+            first: str | None = None
+            last: str | None = None
+
+            @model_validator(mode="before")
+            @classmethod
+            def split(cls, value):
+                if isinstance(value, dict) and "full_name" in value:
+                    first, last = value["full_name"].split(" ", 1)
+                    return {"first": first, "last": last}
+                return value
+
+        evaluator = StructuredOutputSimilarity(Name)
+        source_form = evaluator.evaluate(_data({"full_name": "Ada Lovelace"}, Name(first="Ada", last="Lovelace")))[0]
+        instances = evaluator.evaluate(_data(Name(first="Ada", last="Lovelace"), Name(first="Ada", last="Lovelace")))[0]
+
+        assert source_form.test_pass is False and "has keys full_name" in (source_form.reason or "")
+        assert (instances.score, instances.test_pass) == (1.0, True)
+
+    @pytest.mark.parametrize(
+        "ground_truth",
+        [
+            "2x2 is 4.",
+            '["a", "b"]',
+            ["a", "b"],
+            4,
+            (1, 2),
+            {1, 2},
+            Decimal("4"),
+            b'{"invoice_id": "I"}',
+            RootModel[int](5),
+        ],
+        ids=["prose", "json-list", "list", "int", "tuple", "set", "decimal", "bytes", "scalar-root-model"],
+    )
+    def test_ground_truth_that_is_not_an_object_fails(self, ground_truth):
+        """Not skipped: a not-applicable row passes and leaves the mean, which would hide it."""
+        outputs = StructuredOutputSimilarity(Invoice).evaluate(_data(ground_truth, _invoice()))
+
+        assert (outputs[0].score, outputs[0].test_pass, outputs[0].label) == (0.0, False, "Invoice")
+        assert (outputs[0].reason or "").startswith("could not compare as Invoice: expected_output ")
+
+    def test_a_malformed_json_object_fails_with_the_parse_error(self):
+        outputs = StructuredOutputSimilarity(Invoice).evaluate(_data('{"invoice_id": "INV-1"', _invoice()))
+
+        assert outputs[0].test_pass is False
+        assert (outputs[0].reason or "").startswith(
+            "could not compare as Invoice: expected_output is a string that is not JSON"
+        )

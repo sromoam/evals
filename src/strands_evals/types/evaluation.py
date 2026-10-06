@@ -131,11 +131,9 @@ class EvaluationOutput(BaseModel):
         label: The categorical label corresponding to the score, or `NOT_APPLICABLE` when there
             was nothing to judge.
         metadata: Evaluator-specific detail that does not fit the four scalars above, for
-            evaluators whose result is richer than one number. Kept on the row so it stays with
-            the report: it survives `EvaluationReport.flatten` and `model_dump_json()`, which
-            data held on the evaluator instance does not. Left as None by evaluators that have
-            nothing extra to report. Telemetry emits the aggregate score, reason and label only,
-            so nothing here is exported.
+            evaluators whose result is richer than one number. It stays with the report, so it
+            survives `EvaluationReport.flatten` and `model_dump_json()`. Left as None by
+            evaluators that have nothing extra to report. Not exported to telemetry.
     """
 
     score: float

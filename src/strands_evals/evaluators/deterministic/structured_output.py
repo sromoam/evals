@@ -9,19 +9,27 @@ Requires the `stickler` extra: `pip install "strands-agents-evals[stickler]"`.
 """
 
 import importlib
+import json
 import logging
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
-from pydantic import BaseModel, ValidationError
+from pydantic import VERSION as PYDANTIC_VERSION
+from pydantic import AliasChoices, AliasPath, BaseModel, RootModel, ValidationError
 from strands.agent.agent_result import AgentResult
 
 from ...types.evaluation import NOT_APPLICABLE, EvaluationData, EvaluationOutput, InputT, OutputT
 from ...types.evaluation_report import EvaluationReport
 from ..evaluator import Evaluator
 
+if TYPE_CHECKING:
+    from stickler.utils.process_evaluation import ProcessEvaluation
+
 logger = logging.getLogger(__name__)
 
-# The field detail `evaluate` writes on a scored row. A row carries all of it or none.
+# Marks the rows this evaluator scored. `metadata` is open to every evaluator, so rows are
+# selected on this value rather than on key names another evaluator may also write.
+_MARKER = "StructuredOutputSimilarity"
+# The field detail on a marked row. A marked row carries all of it, or it is corrupted.
 _DETAIL_KEYS = frozenset({"field_scores", "matched", "precision", "recall", "f1", "comparison"})
 
 
@@ -49,13 +57,39 @@ def _resolve_model_cls(model_cls: type[BaseModel] | str) -> type[BaseModel]:
     """Accept a model class, or the dotted path `to_dict` writes for one.
 
     Raises:
-        TypeError: If the value does not resolve to a Pydantic model class.
+        TypeError: If the value does not resolve to a Pydantic model class with named fields.
     """
     if isinstance(model_cls, str):
         model_cls = _import_dotted_path(model_cls)
     if not (isinstance(model_cls, type) and issubclass(model_cls, BaseModel)):
         raise TypeError(f"model_cls must be a Pydantic model class; got {model_cls!r}")
+    if issubclass(model_cls, RootModel) or not model_cls.model_fields:
+        # Values are recognized by their field names, and a RootModel stores its value under
+        # none: its cached form has no `root` key, so it could not be read back.
+        raise TypeError(f"model_cls must have named fields to compare; {model_cls.__name__} has none")
     return model_cls
+
+
+def _accepted_keys(model_cls: type[BaseModel]) -> frozenset[str]:
+    """Every top-level key pydantic reads a field of `model_cls` from, validating by name.
+
+    Names always count, since values are validated with `by_name=True`. A validation alias
+    replaces the alias for reading, and neither counts when the model sets
+    `validate_by_alias=False`.
+    """
+    by_alias = model_cls.model_config.get("validate_by_alias", True)
+    keys: set[str] = set()
+    for name, info in model_cls.model_fields.items():
+        keys.add(name)
+        if not by_alias:
+            continue
+        alias = info.validation_alias if info.validation_alias is not None else info.alias
+        for choice in alias.choices if isinstance(alias, AliasChoices) else [alias]:
+            if isinstance(choice, str):
+                keys.add(choice)
+            elif isinstance(choice, AliasPath) and choice.path and isinstance(choice.path[0], str):
+                keys.add(choice.path[0])
+    return frozenset(keys)
 
 
 def _import_dotted_path(path: str) -> Any:
@@ -137,13 +171,13 @@ class StructuredOutputReport(EvaluationReport):
         StructuredOutputReport.from_file("report.json").metrics()
     """
 
-    def metrics(self, *, evaluator: str | None = None) -> Any:
+    def metrics(self, *, evaluator: str | None = None) -> "ProcessEvaluation":
         """Per-field metrics across every scored case in the report.
 
         A nested path only counts documents whose parent item scored at or above
         `match_threshold`; below it, the item counts as one wrong unit under the parent
-        path. Rows without field detail are skipped: output that failed to validate, cases
-        with no ground truth, and rows from other evaluators.
+        path. Rows without field detail are skipped: values that could not be read as the
+        model, cases with no ground truth, and rows from other evaluators.
 
         Args:
             evaluator: Evaluator name to read, for a report carrying more than one.
@@ -160,21 +194,21 @@ class StructuredOutputReport(EvaluationReport):
         """
         _, aggregate_from_comparisons = _stickler()
         scored = self._scored_rows(evaluator)
-        names = sorted({str(case.get("evaluator")) for case, _ in scored})
+        names = sorted({str(case.get("evaluator")) for case, _, _ in scored})
         if len(names) > 1:
             raise ValueError(
                 f"report carries comparisons from {len(names)} evaluators ({', '.join(names)}); "
                 f"pass evaluator=<name> to aggregate one schema at a time"
             )
-        models = sorted({str(row.label) for _, row in scored})
+        models = sorted({str(row.label) for _, row, _ in scored})
         if len(models) > 1:
             raise ValueError(
                 f"report compares {len(models)} models ({', '.join(models)}) under one evaluator name; "
                 f"call metrics() on each report before flattening them, or give the evaluators distinct names"
             )
-        return aggregate_from_comparisons([row.metadata["comparison"] for _, row in scored if row.metadata])
+        return aggregate_from_comparisons([detail["comparison"] for _, _, detail in scored])
 
-    def per_case(self, *, evaluator: str | None = None) -> list[Mapping[str, Any]]:
+    def per_case(self, *, evaluator: str | None = None) -> list[dict[str, Any]]:
         """Per-document field scores in case order, as a flat table.
 
         Nested list children have no per-leaf score, so they appear in `metrics` only.
@@ -184,7 +218,7 @@ class StructuredOutputReport(EvaluationReport):
             evaluator: Evaluator name to read, for a report carrying more than one.
 
         Returns:
-            One entry per scored case: `case`, `model`, `overall_score`, `test_pass`,
+            One entry per scored case: `case`, `evaluator`, `model`, `overall_score`, `test_pass`,
             `matched`, `precision`, `recall`, `f1` and `field_scores`. `matched` is
             stickler's score-only verdict; `test_pass` also requires recall.
 
@@ -195,6 +229,7 @@ class StructuredOutputReport(EvaluationReport):
         return [
             {
                 "case": case.get("name"),
+                "evaluator": case.get("evaluator"),
                 "model": row.label,
                 "overall_score": row.score,
                 "test_pass": row.test_pass,
@@ -204,12 +239,11 @@ class StructuredOutputReport(EvaluationReport):
                 "f1": detail["f1"],
                 "field_scores": dict(detail["field_scores"]),
             }
-            for case, row in self._scored_rows(evaluator)
-            if (detail := row.metadata) is not None
+            for case, row, detail in self._scored_rows(evaluator)
         ]
 
-    def _scored_rows(self, evaluator: str | None) -> list[tuple[Mapping[str, Any], EvaluationOutput]]:
-        """The `(case, row)` pairs carrying field detail, for one evaluator when `evaluator` is set.
+    def _scored_rows(self, evaluator: str | None) -> list[tuple[Mapping[str, Any], EvaluationOutput, dict[str, Any]]]:
+        """The `(case, row, detail)` triples for scored rows, for one evaluator when `evaluator` is set.
 
         The single rule both rollups select by, so they never disagree about which rows count.
         It returns rows or raises: an empty result would read the same as a clean one.
@@ -225,24 +259,26 @@ class StructuredOutputReport(EvaluationReport):
                     f"no rows from evaluator {evaluator!r}; this report carries: "
                     f"{', '.join(sorted(present)) or '(none)'}"
                 )
-        scored: list[tuple[Mapping[str, Any], EvaluationOutput]] = []
+        scored: list[tuple[Mapping[str, Any], EvaluationOutput, dict[str, Any]]] = []
         for index, rows in enumerate(self.detailed_results):
             case: Mapping[str, Any] = self.cases[index] if index < len(self.cases) else {}
             if evaluator is not None and str(case.get("evaluator")) != evaluator:
                 continue
             for row in rows:
-                carried = _DETAIL_KEYS & (row.metadata or {}).keys()
-                if not carried:
+                detail = row.metadata or {}
+                if detail.get("evaluated_by") != _MARKER:
                     continue
-                if carried != _DETAIL_KEYS:
-                    missing = ", ".join(sorted(_DETAIL_KEYS - carried))
-                    raise ValueError(f"row for case {case.get('name')!r} is missing field detail: {missing}")
-                scored.append((case, row))
+                missing = _DETAIL_KEYS - detail.keys()
+                if missing:
+                    raise ValueError(
+                        f"row for case {case.get('name')!r} is missing field detail: {', '.join(sorted(missing))}"
+                    )
+                scored.append((case, row, detail))
         if not scored:
             source = f"evaluator {evaluator!r}" if evaluator is not None else "this report"
             raise ValueError(
                 f"{source} has no scored structured-output rows: every row is from another evaluator, "
-                f"had no ground truth, or failed to validate"
+                f"had no ground truth, or could not be read as the model"
             )
         return scored
 
@@ -253,9 +289,19 @@ class StructuredOutputSimilarity(Evaluator[InputT, OutputT]):
     Comparison configuration is inferred from the Pydantic model the agent already passes
     as `structured_output_model`; `explain` shows every inferred choice. Each case yields
     one row: the weighted score on `score`, and on `metadata` the per-field scores,
-    `precision`, `recall`, `f1` and the raw comparison. Because the detail lives in the
+    `precision`, `recall`, `f1`, `matched`, the raw comparison, and `evaluated_by`, which
+    marks the row as this evaluator's. A case that cannot be compared scores 0 with
+    `metadata={"error": "unreadable"}` and the reason. Because the detail lives in the
     report, the rollups are methods on `StructuredOutputReport` — pass that as the
     experiment's `report_cls` to get them.
+
+    Both sides of a case are read as `model_cls`. An instance is compared as it is, and an
+    `AgentResult` by its `structured_output`. Anything else (a dict, a JSON string, or an
+    instance of another class) is read by pydantic, as a result store or experiment file
+    hands back the instances it was given: by field name or alias, lax about types, and
+    ignoring keys the model does not define. A value with keys, none of which is a field
+    of `model_cls`, is another schema and fails, so a case gets the same result in memory
+    and read back from a file.
 
     Args:
         model_cls: The Pydantic model the agent emits, or the dotted path `to_dict` writes.
@@ -270,7 +316,7 @@ class StructuredOutputSimilarity(Evaluator[InputT, OutputT]):
 
     Raises:
         ImportError: If the `stickler` extra is not installed.
-        TypeError: If `model_cls` does not resolve to a Pydantic model class.
+        TypeError: If `model_cls` does not resolve to a Pydantic model class with named fields.
     """
 
     def __init__(
@@ -284,9 +330,16 @@ class StructuredOutputSimilarity(Evaluator[InputT, OutputT]):
         """Initialize the evaluator. See the class docstring for arguments."""
         super().__init__(name=name)
         eval_for, _ = _stickler()
+        if tuple(int(part) for part in PYDANTIC_VERSION.split(".")[:2]) < (2, 12):
+            raise ImportError(
+                f"StructuredOutputSimilarity requires pydantic>=2.12 (found {PYDANTIC_VERSION}). Install it "
+                'with: pip install "strands-agents-evals[stickler]"'
+            )
         self._model_cls = _resolve_model_cls(model_cls)
-        self.match_threshold = match_threshold
-        self.weight_hints = weight_hints
+        self._accepted_keys = _accepted_keys(self._model_cls)
+        # Read-only: `_spec` is built from both, so changing one later would split the verdict.
+        self._match_threshold = match_threshold
+        self._weight_hints = weight_hints
         # Built once here, so a model stickler cannot handle fails at construction.
         self._spec = eval_for(
             self._model_cls,
@@ -299,11 +352,21 @@ class StructuredOutputSimilarity(Evaluator[InputT, OutputT]):
         """The Pydantic model every case is compared as."""
         return self._model_cls
 
+    @property
+    def match_threshold(self) -> float:
+        """Similarity at which an object counts as a match; see the class docstring."""
+        return self._match_threshold
+
+    @property
+    def weight_hints(self) -> bool:
+        """Whether fields are weighted by name-based heuristics."""
+        return self._weight_hints
+
     def to_dict(self) -> dict:
         """Convert the evaluator into a dictionary, with `model_cls` as a dotted path.
 
         A model no other process can import (defined in `__main__` or inside a function)
-        is still written, with a warning, as `OutputEvaluator.to_dict` does for tools.
+        is still written, with a warning, since `from_file` then fails with the path named.
 
         Returns:
             dict: The evaluator's information.
@@ -312,11 +375,13 @@ class StructuredOutputSimilarity(Evaluator[InputT, OutputT]):
         path = f"{self._model_cls.__module__}.{self._model_cls.__qualname__}"
         if self._model_cls.__module__ == "__main__" or "<locals>" in self._model_cls.__qualname__:
             logger.warning(
-                "model_cls=<%s> | not importable by dotted path, so from_file() will not reload this "
-                "evaluator, move the model to an importable module to make the experiment portable",
+                "model_cls=<%s> | model is not importable by dotted path | move it to an importable "
+                "module so the experiment file can reload this evaluator",
                 path,
             )
         _dict["model_cls"] = path
+        _dict["match_threshold"] = self._match_threshold
+        _dict["weight_hints"] = self._weight_hints
         return _dict
 
     def evaluate(self, evaluation_case: EvaluationData[InputT, OutputT]) -> list[EvaluationOutput]:
@@ -326,8 +391,8 @@ class StructuredOutputSimilarity(Evaluator[InputT, OutputT]):
             evaluation_case: The case to score.
 
         Returns:
-            One row. `NOT_APPLICABLE` when there is no ground truth or it belongs to
-            another schema; score 0 with the reason when the output will not validate.
+            One row. `NOT_APPLICABLE` when there is no ground truth; score 0 with the reason
+            when either side cannot be read as `model_cls`.
         """
         name = self._model_cls.__name__
         if evaluation_case.expected_output is None:
@@ -340,35 +405,18 @@ class StructuredOutputSimilarity(Evaluator[InputT, OutputT]):
                 )
             ]
 
-        dropped = self._foreign_fields(evaluation_case.expected_output)
-        if dropped:
-            # Converting would drop these fields, and an all-optional model would then
-            # compare blank against blank and score a perfect 1.0.
-            other = type(evaluation_case.expected_output).__name__
-            return [
-                EvaluationOutput(
-                    score=0.0,
-                    test_pass=True,
-                    reason=(
-                        f"expected_output is {other}, whose fields {', '.join(dropped)} are not "
-                        f"on {name}, so there was nothing for this evaluator to judge"
-                    ),
-                    label=NOT_APPLICABLE,
-                )
-            ]
-
         try:
-            expected = self._coerce(evaluation_case.expected_output, "expected_output")
-            actual = self._coerce(evaluation_case.actual_output, "actual_output")
-        except (ValidationError, TypeError) as exc:
-            logger.debug("case=<%s>, model=<%s> | output did not validate", evaluation_case.name, name)
+            expected = self._read(evaluation_case.expected_output, "expected_output")
+            actual = self._read(evaluation_case.actual_output, "actual_output")
+        except (ValueError, TypeError) as exc:
+            logger.debug("case=<%s>, model=<%s> | could not read case as model", evaluation_case.name, name)
             return [
                 EvaluationOutput(
                     score=0.0,
                     test_pass=False,
                     reason=f"could not compare as {name}: {exc}",
                     label=name,
-                    metadata={"error": "validation_failed"},
+                    metadata={"error": "unreadable"},
                 )
             ]
 
@@ -390,6 +438,7 @@ class StructuredOutputSimilarity(Evaluator[InputT, OutputT]):
                 reason=self._weakest(result.field_scores),
                 label=name,
                 metadata={
+                    "evaluated_by": _MARKER,
                     "field_scores": dict(result.field_scores),
                     "precision": result.precision,
                     "recall": result.recall,
@@ -409,18 +458,16 @@ class StructuredOutputSimilarity(Evaluator[InputT, OutputT]):
         """
         return self._spec.explain()
 
-    def _foreign_fields(self, value: Any) -> list[str]:
-        """Fields a model of another class has that `model_cls` lacks.
+    def _read(self, value: Any, which: str) -> BaseModel:
+        """Read one side of a case as `model_cls`; see the class docstring for the rules.
 
-        Empty when nothing would be lost converting, including the same class defined
-        twice (a re-run notebook cell), so the test is on fields, not class identity.
+        Another model is read from its JSON form, the form a result store hands back, so it
+        reads the same both ways.
+
+        Raises:
+            TypeError: If the value is not a form this evaluator reads, or is another schema.
+            ValueError: If it is a string that is not JSON, or does not validate.
         """
-        if not isinstance(value, BaseModel) or isinstance(value, self._model_cls):
-            return []
-        return sorted(set(type(value).model_fields) - set(self._model_cls.model_fields))
-
-    def _coerce(self, value: Any, which: str) -> BaseModel:
-        """Accept a model instance, an `AgentResult`, a dict, or a JSON string."""
         cls = self._model_cls
         if isinstance(value, AgentResult):
             if value.structured_output is None:
@@ -431,21 +478,31 @@ class StructuredOutputSimilarity(Evaluator[InputT, OutputT]):
             value = value.structured_output
         if isinstance(value, cls):
             return value
+        form = type(value).__name__
         if isinstance(value, BaseModel):
-            dropped = self._foreign_fields(value)
-            if dropped:
-                raise TypeError(
-                    f"{which} is {type(value).__name__}, whose fields {', '.join(dropped)} are not on {cls.__name__}"
-                )
-            return cls.model_validate(value.model_dump())
-        if isinstance(value, dict):
-            return cls.model_validate(value)
-        if isinstance(value, str):
-            return cls.model_validate_json(value)
-        raise TypeError(
-            f"{which} must be a {cls.__name__} instance, an AgentResult, a dict, or a JSON string; "
-            f"got {type(value).__name__}"
-        )
+            value = value.model_dump(mode="json")
+        elif isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{which} is a string that is not JSON: {exc}") from exc
+            form = f"JSON {type(value).__name__}"
+        if not isinstance(value, dict):
+            raise TypeError(
+                f"{which} must be an instance of {cls.__name__}, an AgentResult, a dict, or a JSON object; got {form}"
+            )
+        if value and not {str(key) for key in value} & self._accepted_keys:
+            # Validated, it would be a blank document, and blank against blank scores 1.0.
+            keys = ", ".join(sorted(map(str, value)))
+            raise TypeError(f"{which} ({form}) has keys {keys}, none of which is a field of {cls.__name__}")
+        try:
+            return cls.model_validate(value, strict=False, extra="ignore", by_name=True)
+        except ValidationError as exc:
+            errors = "; ".join(
+                f"{'.'.join(map(str, error['loc'])) or '(root)'}: {error['msg']}"
+                for error in exc.errors(include_url=False)
+            )
+            raise ValueError(f"{which} did not validate: {errors}") from exc
 
     @staticmethod
     def _weakest(field_scores: Mapping[str, float], limit: int = 4) -> str:

@@ -514,8 +514,8 @@ Deterministic and offline: no LLM judge, no credentials, no per-call cost.
 
 ```python
 from pydantic import BaseModel
-from strands_evals import Experiment
-from strands_evals.evaluators import StructuredOutputReport, StructuredOutputSimilarity
+from strands_evals import Experiment, StructuredOutputReport
+from strands_evals.evaluators import StructuredOutputSimilarity
 
 class LineItem(BaseModel):
     sku: str | None = None
@@ -539,6 +539,8 @@ report.metrics().field_metrics    # per-field confusion matrix, keyed by dotted 
 evaluator.explain()               # the comparator chosen for each field, and why
 ```
 
+For an invoice with two line items, every other field correct:
+
 | | `Equals` | `StructuredOutputSimilarity` |
 |---|---|---|
 | list reordered, content identical | `0.0` | `1.0` |
@@ -546,15 +548,22 @@ evaluator.explain()               # the comparator chosen for each field, and wh
 
 In the second row, `reason` reads `weakest fields: line_items=0.75`, and `metrics()` reports
 nested paths such as `line_items.quantity` across the whole dataset. A list item that scores
-below `match_threshold` counts as one wrong item under its parent path, so check the `fd`
-count on `line_items` as well.
+below `match_threshold` counts as one wrong item under its parent path and is not counted
+under its child paths, so here the error shows as `fd=1` on `line_items`, not on
+`line_items.quantity`.
 
 **Saved reports.** The field detail is stored on each report row, so it survives
 `report.to_file()` and `strands-evals run --output`. The CLI cannot set `report_cls`, so read
-its output back with `StructuredOutputReport.from_file("report.json").metrics()`.
+its output back with `StructuredOutputReport.from_file("report.json").metrics()`. Cases read
+back from a result store or experiment file score the same as in memory when the model
+survives a round-trip through its own JSON; a custom serializer, or a validator that changes
+a value on every pass, does not.
 
-**One schema per evaluator.** `model_cls` is required. If your agent emits more than one
-output type, run a separate `Experiment` for each.
+**One schema per evaluator.** `model_cls` is required: a result store or experiment file hands
+cases back as plain dicts, and the model is what reads them. A non-empty value with none of
+the model's fields fails, with a reason naming its keys; one sharing a field name with the
+model is read as the model, ignoring its other keys. Every evaluator runs on every case, so
+if your agent emits more than one output type, run a separate `Experiment` for each.
 
 **`test_pass` on sparse schemas.** The score counts a field left blank on both sides as
 correct, so a 10-field model whose ground truth fills 2 fields scores `0.80` against an empty

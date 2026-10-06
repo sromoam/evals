@@ -68,7 +68,8 @@ langchain = [
 ]
 adk = ["google-adk>=2.0.0,<3.0.0"]
 # StructuredOutputSimilarity: field-level structured-output scoring via stickler.
-stickler = ["stickler-eval>=1.0.0,<2.0.0"]
+# pydantic>=2.12 for `model_validate(extra=...)`, which reads cached values back.
+stickler = ["stickler-eval>=1.0.0,<2.0.0", "pydantic>=2.12.0,<3.0.0"]
 claude = [
     "claude-agent-sdk>=0.2.0,<0.3.0",
     "openinference-instrumentation-claude-agent-sdk>=0.1.8,<0.2.0",
