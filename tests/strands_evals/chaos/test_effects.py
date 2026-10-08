@@ -4,7 +4,9 @@ import random
 
 from strands_evals.chaos.effects import (
     CorruptValues,
+    EmptyResponse,
     ExecutionError,
+    FullRefusal,
     NetworkError,
     RemoveFields,
     Timeout,
@@ -225,3 +227,22 @@ class TestCorruptValues:
     def test_effect_type(self):
         effect = CorruptValues()
         assert effect.effect_type == "corrupt_values"
+
+
+class TestPreEffectApply:
+    """Pre-hook model effects return cancel text from apply()."""
+
+    def test_empty_response_apply_returns_single_space(self):
+        """EmptyResponse.apply() returns a single space so event.cancel is truthy."""
+        result = EmptyResponse().apply()
+        assert result == " "
+
+    def test_full_refusal_apply_returns_template(self):
+        """FullRefusal.apply() returns one of the refusal templates."""
+        result = FullRefusal().apply()
+        assert result in FullRefusal._REFUSAL_TEMPLATES
+
+    def test_pre_effect_apply_ignores_content(self):
+        """The content argument exists for the base signature and does not affect the result."""
+        assert EmptyResponse().apply("ignored") == " "
+        assert FullRefusal().apply([{"text": "ignored"}]) in FullRefusal._REFUSAL_TEMPLATES

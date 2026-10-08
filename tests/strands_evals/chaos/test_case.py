@@ -1,10 +1,18 @@
 """Unit tests for ChaosCase."""
 
 import pytest
+from pydantic import ValidationError as PydanticValidationError
 
 from strands_evals import Case
 from strands_evals.chaos import ChaosCase
-from strands_evals.chaos.effects import CorruptValues, Timeout, TruncateFields
+from strands_evals.chaos.effects import (
+    CorruptValues,
+    EmptyResponse,
+    FullRefusal,
+    MalformedJson,
+    Timeout,
+    TruncateFields,
+)
 
 
 class TestChaosCase:
@@ -53,8 +61,8 @@ class TestChaosCase:
             )
 
     def test_unknown_effect_category_raises(self):
-        """Unknown effect category keys should be rejected."""
-        with pytest.raises(ValueError, match="Unknown effect categories"):
+        """Unknown effect category keys should be rejected by the ChaosEffectsConfig schema."""
+        with pytest.raises(ValueError, match="extra_forbidden"):
             ChaosCase(
                 name="bad_category",
                 input="hello",
@@ -114,6 +122,153 @@ class TestChaosCase:
         assert isinstance(restored.tool_effects["tool_a"][0], Timeout)
         assert isinstance(restored.tool_effects["tool_b"][0], TruncateFields)
         assert restored.tool_effects["tool_b"][0].max_length == 5
+
+
+class TestKeyedDictConstruction:
+    """Effects are constructed via keyed dict form."""
+
+    def test_keyed_dict_form_is_valid(self):
+        """ChaosCase accepts effects={"model_effects": {"*": [...]}}."""
+        case = ChaosCase(
+            name="keyed",
+            input="test",
+            effects={"model_effects": {"*": [MalformedJson()]}},
+        )
+        assert case.model_effects == [MalformedJson()]
+
+    def test_wildcard_resolver(self):
+        """model_effects property resolves '*' wildcard to flat list."""
+        case = ChaosCase(
+            name="wildcard",
+            input="test",
+            effects={"model_effects": {"*": [FullRefusal(), MalformedJson()]}},
+        )
+        assert len(case.model_effects) == 2
+        assert isinstance(case.model_effects[0], FullRefusal)
+        assert isinstance(case.model_effects[1], MalformedJson)
+
+    def test_empty_effects_baseline(self):
+        """Empty effects dict produces no model_effects."""
+        case = ChaosCase(name="baseline", input="test", effects={})
+        assert case.model_effects == []
+
+
+class TestEffectFamilyValidation:
+    """Effects placed in the wrong category are rejected structurally by Pydantic."""
+
+    def test_tool_effect_in_model_effects_rejected(self):
+        """A ToolEffect under model_effects is rejected by discriminated union."""
+        with pytest.raises(PydanticValidationError, match="union_tag_invalid"):
+            ChaosCase(
+                name="bad",
+                input="test",
+                effects={"model_effects": {"*": [Timeout()]}},
+            )
+
+    def test_model_effect_in_tool_effects_rejected(self):
+        """A ModelEffect under tool_effects is rejected by discriminated union."""
+        with pytest.raises(PydanticValidationError, match="union_tag_invalid"):
+            ChaosCase(
+                name="bad",
+                input="test",
+                effects={"tool_effects": {"search": [FullRefusal()]}},
+            )
+
+    def test_model_effect_in_tool_effects_rejected_via_model_validate(self):
+        """A ModelEffect under tool_effects is rejected on the model_validate (dict) path."""
+        with pytest.raises(PydanticValidationError, match="union_tag_invalid"):
+            ChaosCase.model_validate(
+                {
+                    "name": "bad_tool",
+                    "input": "test",
+                    "effects": {"tool_effects": {"search": [{"effect_type": "full_refusal"}]}},
+                }
+            )
+
+    def test_tool_effect_in_model_effects_rejected_via_model_validate(self):
+        """A ToolEffect under model_effects is rejected on the model_validate (dict) path."""
+        with pytest.raises(PydanticValidationError, match="union_tag_invalid"):
+            ChaosCase.model_validate(
+                {
+                    "name": "bad_model",
+                    "input": "test",
+                    "effects": {"model_effects": {"*": [{"effect_type": "timeout"}]}},
+                }
+            )
+
+    def test_named_model_key_rejected(self):
+        """A non-'*' key in model_effects is rejected by Literal constraint."""
+        with pytest.raises(PydanticValidationError, match="literal_error"):
+            ChaosCase(
+                name="bad",
+                input="test",
+                effects={"model_effects": {"claude-sonnet": [MalformedJson()]}},
+            )
+
+    def test_bogus_category_rejected(self):
+        """An unknown effects category is rejected by extra='forbid'."""
+        with pytest.raises(PydanticValidationError, match="extra_forbidden"):
+            ChaosCase(
+                name="bad",
+                input="test",
+                effects={"bogus": {"x": []}},
+            )
+
+
+class TestSinglePreModelEffect:
+    """At most one pre-hook model effect per case — pre effects cancel the model call."""
+
+    def test_two_pre_effects_rejected(self):
+        """FullRefusal + EmptyResponse (both pre) is rejected, naming both effects."""
+        with pytest.raises(PydanticValidationError, match="only 1 is allowed"):
+            ChaosCase(
+                name="two_pre",
+                input="test",
+                effects={"model_effects": {"*": [FullRefusal(), EmptyResponse()]}},
+            )
+
+    def test_two_pre_effects_rejected_via_model_validate(self):
+        """Two pre effects are rejected on the model_validate (dict) path."""
+        with pytest.raises(PydanticValidationError, match="only 1 is allowed"):
+            ChaosCase.model_validate(
+                {
+                    "name": "two_pre",
+                    "input": "test",
+                    "effects": {
+                        "model_effects": {"*": [{"effect_type": "full_refusal"}, {"effect_type": "empty_response"}]}
+                    },
+                }
+            )
+
+    def test_rejection_names_both_effects(self):
+        """The error message identifies both offending pre effects."""
+        with pytest.raises(PydanticValidationError) as exc_info:
+            ChaosCase(
+                name="two_pre",
+                input="test",
+                effects={"model_effects": {"*": [FullRefusal(), EmptyResponse()]}},
+            )
+        message = str(exc_info.value)
+        assert "FullRefusal" in message
+        assert "EmptyResponse" in message
+
+    def test_single_pre_effect_accepted(self):
+        """One pre effect alone is valid."""
+        case = ChaosCase(
+            name="one_pre",
+            input="test",
+            effects={"model_effects": {"*": [FullRefusal()]}},
+        )
+        assert len(case.model_effects) == 1
+
+    def test_pre_plus_post_mix_accepted(self):
+        """A pre + post mix is valid — only multiple pre effects are rejected."""
+        case = ChaosCase(
+            name="mixed",
+            input="test",
+            effects={"model_effects": {"*": [FullRefusal(), MalformedJson()]}},
+        )
+        assert len(case.model_effects) == 2
 
 
 class TestChaosCaseExpand:

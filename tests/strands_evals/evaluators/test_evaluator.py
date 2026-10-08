@@ -1,17 +1,24 @@
+from datetime import datetime
 from unittest.mock import MagicMock
 
 import pytest
 from strands.models.model import Model
 
+from strands_evals import Case, Experiment
 from strands_evals.evaluators import Evaluator, OutputEvaluator
 from strands_evals.evaluators.evaluator import DEFAULT_BEDROCK_MODEL_ID
 from strands_evals.types import EvaluationData, EvaluationOutput
 from strands_evals.types.trace import (
     AssistantMessage,
+    SpanInfo,
     TextContent,
+    ToolCall,
     ToolCallContent,
     ToolConfig,
+    ToolExecution,
+    ToolResult,
     ToolResultContent,
+    TraceLevelInput,
     UserMessage,
 )
 
@@ -155,8 +162,12 @@ def test_to_dict_with_string_model():
     assert evaluator_dict["model"] == "bedrock-model-id"
 
 
-def test_to_dict_with_none_model():
-    """Test that to_dict handles None model correctly (uses default)"""
+def test_to_dict_omits_default_none_model():
+    """model=None means 'resolve the default at runtime', so it must not be serialized.
+
+    Writing it out as model_id=DEFAULT_BEDROCK_MODEL_ID pins every reloaded experiment's
+    judge to that specific model and loses the runtime-default semantics.
+    """
 
     evaluator = OutputEvaluator(rubric="test rubric", model=None)
     evaluator_dict = evaluator.to_dict()
@@ -164,7 +175,17 @@ def test_to_dict_with_none_model():
     assert evaluator_dict["evaluator_type"] == "OutputEvaluator"
     assert evaluator_dict["rubric"] == "test rubric"
     assert "model" not in evaluator_dict
-    assert evaluator_dict["model_id"] == DEFAULT_BEDROCK_MODEL_ID
+    assert "model_id" not in evaluator_dict
+
+
+def test_none_model_survives_round_trip_as_none():
+    """A default-model evaluator must reload with model=None, not an explicit pin."""
+    original = OutputEvaluator(rubric="test rubric", model=None)
+    experiment = Experiment(cases=[Case(name="c", input="i", expected_output="o")], evaluators=[original])
+
+    reloaded = Experiment.from_dict(experiment.to_dict())
+
+    assert reloaded.evaluators[0].model is None
 
 
 def test_has_text_content_with_single_text_at_start():
@@ -289,6 +310,81 @@ def test_extract_text_content_user_message_with_tool_result():
 
     result = evaluator._extract_text_content(msg)
     assert result == "Here's the result"
+
+
+def _span_info():
+    now = datetime.now()
+    return SpanInfo(session_id="s", start_time=now, end_time=now)
+
+
+def _trace_input(session_history):
+    return TraceLevelInput(
+        span_info=_span_info(),
+        agent_response=TextContent(text="final answer"),
+        session_history=session_history,
+    )
+
+
+def test_extract_user_prompt_empty_history():
+    """No session history yields an empty prompt."""
+    evaluator = SimpleEvaluator()
+    assert evaluator._extract_user_prompt(_trace_input([])) == ""
+
+
+def test_extract_user_prompt_walks_back_past_tool_execution_list():
+    """The user query is reachable when a tool-execution list is the last history entry (#355)."""
+    evaluator = SimpleEvaluator()
+    tool_exec = [
+        ToolExecution(
+            tool_call=ToolCall(name="calculator", arguments={"x": 1}, tool_call_id="t1"),
+            tool_result=ToolResult(content="1", tool_call_id="t1"),
+        )
+    ]
+    history = [UserMessage(content=[TextContent(text="What is 1?")]), tool_exec]
+
+    assert evaluator._extract_user_prompt(_trace_input(history)) == "What is 1?"
+
+
+def test_extract_user_prompt_text_not_first_content_block():
+    """A user message whose text is not at index 0 still yields the query (PR #405 review).
+
+    _has_text_content passes on any TextContent block, but reading only content[0]
+    would miss the text here and fall through to the wrong (or no) turn.
+    """
+    evaluator = SimpleEvaluator()
+    user_msg = UserMessage(
+        content=[
+            ToolResultContent(content="tool output", tool_call_id="t1"),
+            TextContent(text="the real question"),
+        ]
+    )
+    tool_exec = [
+        ToolExecution(
+            tool_call=ToolCall(name="calculator", arguments={"x": 1}, tool_call_id="t2"),
+            tool_result=ToolResult(content="2", tool_call_id="t2"),
+        )
+    ]
+    history = [user_msg, tool_exec]
+
+    assert evaluator._extract_user_prompt(_trace_input(history)) == "the real question"
+
+
+def test_extract_user_prompt_returns_most_recent_user_turn():
+    """With multiple user turns, the nearest one (not an earlier turn) is returned."""
+    evaluator = SimpleEvaluator()
+    history = [
+        UserMessage(content=[TextContent(text="first question")]),
+        AssistantMessage(content=[TextContent(text="first answer")]),
+        UserMessage(content=[ToolResultContent(content="ctx", tool_call_id="t1"), TextContent(text="second question")]),
+        [
+            ToolExecution(
+                tool_call=ToolCall(name="calculator", arguments={"x": 1}, tool_call_id="t2"),
+                tool_result=ToolResult(content="3", tool_call_id="t2"),
+            )
+        ],
+    ]
+
+    assert evaluator._extract_user_prompt(_trace_input(history)) == "second question"
 
 
 def test_get_name_defaults_to_class_name():

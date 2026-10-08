@@ -1,7 +1,10 @@
 <div align="center">
   <div>
     <a href="https://strandsagents.com">
-      <img src="https://strandsagents.com/latest/assets/logo-github.svg" alt="Strands Agents" width="55px" height="105px">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="https://strandsagents.com/latest/assets/wordmark-github-dark.svg">
+        <img src="https://strandsagents.com/latest/assets/wordmark-github-light.svg" alt="Strands" width="320">
+      </picture>
     </a>
   </div>
 
@@ -154,6 +157,9 @@ pip install -e ".[test]"
 
 # Install with both test and dev dependencies
 pip install -e ".[test,dev]"
+
+# Install with field-level structured-output scoring
+pip install -e ".[stickler]"
 ```
 
 ## Features at a Glance
@@ -500,6 +506,74 @@ class PolicyComplianceEvaluator(Evaluator[str, str]):
         return []
 ```
 
+### Field-Level Structured Output Scoring
+
+`Equals` compares structured output with whole-object `==`, so it scores 0.0 or 1.0.
+`StructuredOutputSimilarity` compares field by field and names the field to fix.
+Deterministic and offline: no LLM judge, no credentials, no per-call cost.
+
+```python
+from pydantic import BaseModel
+from strands_evals import Experiment, StructuredOutputReport
+from strands_evals.evaluators import StructuredOutputSimilarity
+
+class LineItem(BaseModel):
+    sku: str | None = None
+    quantity: int | None = None
+
+class Invoice(BaseModel):
+    invoice_id: str
+    vendor_name: str
+    total_amount: float | None = None
+    line_items: list[LineItem] = []
+
+evaluator = StructuredOutputSimilarity(Invoice)   # the model the agent emits as structured_output_model
+report = Experiment(
+    cases=cases,
+    evaluators=[evaluator],
+    report_cls=StructuredOutputReport,            # adds the rollups below
+).run_evaluations(task)
+
+report.per_case()                 # per-document field scores, precision, recall and f1
+report.metrics().field_metrics    # per-field confusion matrix, keyed by dotted path
+evaluator.explain()               # the comparator chosen for each field, and why
+```
+
+For an invoice with two line items, every other field correct:
+
+| | `Equals` | `StructuredOutputSimilarity` |
+|---|---|---|
+| list reordered, content identical | `0.0` | `1.0` |
+| one quantity wrong, list reordered | `0.0` | `0.9375` |
+
+In the second row, `reason` reads `weakest fields: line_items=0.75`, and `metrics()` reports
+nested paths such as `line_items.quantity` across the whole dataset. A list item that scores
+below `match_threshold` counts as one wrong item under its parent path and is not counted
+under its child paths, so here the error shows as `fd=1` on `line_items`, not on
+`line_items.quantity`.
+
+**Saved reports.** The field detail is stored on each report row, so it survives
+`report.to_file()` and `strands-evals run --output`. The CLI cannot set `report_cls`, so read
+its output back with `StructuredOutputReport.from_file("report.json").metrics()`. Cases read
+back from a result store or experiment file score the same as in memory when the model
+survives a round-trip through its own JSON; a custom serializer, or a validator that changes
+a value on every pass, does not.
+
+**One schema per evaluator.** `model_cls` is required: a result store or experiment file hands
+cases back as plain dicts, and the model is what reads them. A non-empty value with none of
+the model's fields fails, with a reason naming its keys; one sharing a field name with the
+model is read as the model, ignoring its other keys. Every evaluator runs on every case, so
+if your agent emits more than one output type, run a separate `Experiment` for each.
+
+**`test_pass` on sparse schemas.** The score counts a field left blank on both sides as
+correct, so a 10-field model whose ground truth fills 2 fields scores `0.80` against an empty
+prediction. `test_pass` therefore also requires recall to clear `match_threshold`, which an
+empty prediction cannot. Each row's `metadata` carries `precision`, `recall` and `f1` for
+stricter gates. To weight the fields that matter, declare the model as a stickler
+`StructuredModel` with `ComparableField(weight=...)`, or pass `weight_hints=True`.
+
+Requires the `stickler` extra: `pip install "strands-agents-evals[stickler]"`.
+
 ### Tool Usage and Parameter Evaluation
 
 Evaluate specific aspects of tool usage with specialized evaluators:
@@ -611,6 +685,7 @@ These evaluators work directly with inputs and outputs without requiring OpenTel
 - **OutputEvaluator**: Flexible LLM-based evaluation with custom rubrics
 - **TrajectoryEvaluator**: Action sequence evaluation with built-in scoring tools (supports both list-based trajectories and Session traces via extractors)
 - **InteractionsEvaluator**: Multi-agent interaction and handoff evaluation
+- **StructuredOutputSimilarity**: Field-level scoring of structured output against ground truth, with order-independent list matching and per-field metrics (requires the `stickler` extra)
 - **Custom Evaluators**: Extensible base class for domain-specific logic
 
 ### Trace-Based Evaluators
